@@ -332,6 +332,23 @@ def get_mapper(params_emb, params_pair, features_class, densgiven=False):
         elif fc.name == "DistanceGaussTaperingFeatures_2body":
             return make_array(params_pair[pair]["q_"]).shape[0]*make_array(params_pair[pair]["p_"]).shape[0] \
                 if i is None else make_array(params_pair[pair][i]["q_"]).shape[0]*make_array(params_pair[pair][i]["p_"]).shape[0]
+
+        elif fc.name == "DistancePolynomialTaperingFeatures_2body":
+            return make_array(params_pair[pair]["kappa_"]).shape[0] \
+                if i is None else make_array(params_pair[pair][i]["kappa_"]).shape[0]
+
+        elif fc.name == "DistanceGenericTaperingFeatures_2body":
+            return make_array(params_pair[pair]["kappa_"]).shape[0] \
+                if i is None else make_array(params_pair[pair][i]["kappa_"]).shape[0]
+
+        elif fc.name == "BondOrderParameterFeatures":
+            if "kappa_" in params_pair[pair]:
+                return make_array(params_pair[pair]["kappa_"]).shape[0]*2 * make_array(params_pair[pair]["k"]).shape[0]\
+                    if i is None else make_array(params_pair[pair][i]["kappa_"]).shape[0]*2 * make_array(params_pair[pair][i]["k"]).shape[0]
+            else:
+                return make_array(params_pair[pair]["k"]).shape[0]\
+                    if i is None else make_array(params_pair[pair][i]["k"]).shape[0]
+
         else:
             raise NotImplementedError("features_class '{}' not implemented!".format(fc.name))
     
@@ -340,7 +357,7 @@ def get_mapper(params_emb, params_pair, features_class, densgiven=False):
             return make_array(params_emb[el]["kappa_"]).shape[0] \
                 if i is None else make_array(params_emb[el][i]["kappa_"]).shape[0]
 
-        elif fc.name == "DistanceSineCosineTaperingFeatures_2body":
+        elif fc.name in "DistanceSineCosineTaperingFeatures_2body":
             return make_array(params_emb[el]["kappa_"]).shape[0]*2 \
                 if i is None else make_array(params_emb[el][i]["kappa_"]).shape[0]*2
 
@@ -348,11 +365,25 @@ def get_mapper(params_emb, params_pair, features_class, densgiven=False):
             return make_array(params_emb[el]["q_"]).shape[0]*make_array(params_emb[el]["p_"]).shape[0] \
                 if i is None else make_array(params_emb[el][i]["q_"]).shape[0]*make_array(params_emb[el][i]["p_"]).shape[0]
 
+        elif fc.name == "DistancePolynomialTaperingFeatures_2body":
+            return make_array(params_emb[el]["kappa_"]).shape[0] \
+                if i is None else make_array(params_emb[el][i]["kappa_"]).shape[0]
+        
+        elif fc.name == "DistanceGenericTaperingFeatures_2body":
+            return make_array(params_emb[el]["kappa_"]).shape[0] \
+                if i is None else make_array(params_emb[el][i]["kappa_"]).shape[0]
+
+        elif fc.name in "BondOrderParameterFeatures":
+            return make_array(params_emb[el]["kappa_"]).shape[0]*2 * make_array(params_emb[el]["k"]).shape[0] \
+                if i is None else make_array(params_emb[el][i]["kappa_"]).shape[0]*2 * make_array(params_emb[el][i]["k"]).shape[0]
+
         else:
             raise NotImplementedError("features_class '{}' not implemented!".format(fc.name))
     
     implemented = set(["DistanceSineCosineTaperingFeatures_2body","DistanceCosTaperingFeatures_2body",
-                       "DistanceGaussTaperingFeatures_2body"])
+                       "DistanceGaussTaperingFeatures_2body","DistancePolynomialTaperingFeatures_2body",
+                       "DistanceGenericTaperingFeatures_2body",
+                       "BondOrderParameterFeatures"])
     islist = isinstance(features_class,list)
     if islist:
         for fc in features_class:
@@ -402,7 +433,7 @@ def get_mapper(params_emb, params_pair, features_class, densgiven=False):
 def collect_EAM_design_matrices(r_cut, params_emb, params_pair,  
                                 rpositions, species, cells, return_force=True,
                                 features_class=None, tol0=1e-6, return_mapper=True, 
-                                verbose=False, check_bounds=True, densgiven=False):
+                                verbose=False, check_bounds=True, densgiven=False, return_Phi_list=False):
     """Computes the design matrices for EAM regression.
 
     Parameters
@@ -438,9 +469,16 @@ def collect_EAM_design_matrices(r_cut, params_emb, params_pair,
     t0 = time.time()
 
     if return_mapper:
-        mapper = get_mapper(params_emb, params_pair, features_class, densgiven=densgiven)
+        mapper = get_mapper(params_emb, params_pair, features_class,\
+                            densgiven=densgiven)
     
     N = len(rpositions)
+    if return_Phi_list:
+        Phi_list = {"e_emb":{_el:[] for _el in params_emb}, 
+                    "e_pair":{_pair:[] for _pair in params_pair},
+                    "f_emb":{_el:[] for _el in params_emb}, 
+                    "f_pair":{_pair:[] for _pair in params_pair}}
+        
     for i in range(N): # looping through crystals
         if verbose:
             print("\n{}/{}".format(i+1,N))
@@ -469,6 +507,12 @@ def collect_EAM_design_matrices(r_cut, params_emb, params_pair,
                                                     emb_density_funs=_params_emb[0]["emb_density_funs"], 
                                                     tol0=tol0, check_bounds=check_bounds)
                     _Phi_f_emb = None
+
+                if return_Phi_list:
+                    Phi_list["e_emb"][el].append(_Phi_e_emb)
+                    if return_force:
+                        Phi_list["f_emb"][el].append(_Phi_f_emb)
+
                 _Phi_e_emb = _Phi_e_emb.sum(axis=0)
                 
                 if not el in Phi_e_emb_dict:
@@ -493,6 +537,13 @@ def collect_EAM_design_matrices(r_cut, params_emb, params_pair,
                 _Phi_e_pair = get_crystal_design_matrix(positions=_pos, species=_spec, cell=_cell, r_cut=r_cut, 
                                                 features_class=features_class,
                                                 params_features=_params_pair, return_force=False, check_bounds=check_bounds)
+            _Phi_e_pair *= .5
+
+            if return_Phi_list:
+                Phi_list["e_pair"][sname].append(_Phi_e_pair)
+                if return_force:
+                    Phi_list["f_pair"][sname].append(_Phi_f_pair)
+            
             _Phi_e_pair = _Phi_e_pair.sum(axis=0)
             
             if not sname in Phi_e_pair_dict:
@@ -505,8 +556,8 @@ def collect_EAM_design_matrices(r_cut, params_emb, params_pair,
                     Phi_f_pair_dict[sname] = np.vstack((Phi_f_pair_dict[sname],_Phi_f_pair))
             
     # double counting of pair contributions
-    for sname in Phi_e_pair_dict:
-        Phi_e_pair_dict[sname] /= 2.
+    # for sname in Phi_e_pair_dict:
+    #     Phi_e_pair_dict[sname] /= 2.
     
     if densgiven:
         if return_force:
@@ -544,14 +595,26 @@ def collect_EAM_design_matrices(r_cut, params_emb, params_pair,
 
     if return_mapper:
         if return_force:
-            return Phi_e, Phi_f, Phi_emb, Phi_pair, mapper
+            if return_Phi_list:
+                return Phi_e, Phi_f, Phi_emb, Phi_pair, mapper, Phi_list
+            else:
+                return Phi_e, Phi_f, Phi_emb, Phi_pair, mapper
         else:
-            return Phi_e, Phi_emb, Phi_pair, mapper
+            if return_Phi_list:
+                return Phi_e, Phi_emb, Phi_pair, mapper, Phi_list
+            else:
+                return Phi_e, Phi_emb, Phi_pair, mapper
     else:
         if return_force:
-            return Phi_e, Phi_f, Phi_emb, Phi_pair
+            if return_Phi_list:
+                return Phi_e, Phi_f, Phi_emb, Phi_pair, Phi_list
+            else:
+                return Phi_e, Phi_f, Phi_emb, Phi_pair
         else:
-            return Phi_e, Phi_emb, Phi_pair
+            if return_Phi_list:
+                return Phi_e, Phi_emb, Phi_pair
+            else:
+                return Phi_e, Phi_emb, Phi_pair
 
 
 # def generate_EAM_calculator_from_linear_models(mapper, model, emb_density_funs, r_bounds, Nr,

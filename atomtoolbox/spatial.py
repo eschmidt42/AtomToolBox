@@ -223,7 +223,6 @@ def get_neighbors(positions, upositions=None, r_cut=None,\
     Notes
     -----
     If both r_cut and num_neigh are not None then num_neigh takes precedence.
-    
     """  
     
     # setting up KDTrees for the neighborhood search
@@ -251,7 +250,7 @@ def get_neighbors(positions, upositions=None, r_cut=None,\
         else:
             r = np.linalg.norm(upositions[_idx] - positions[i], axis=1)
         
-        nonzero = np.where(r > tol)[0]
+        nonzero = np.where(np.logical_and(r > tol, r**2<r_cut**2))[0]
         _idx = _idx[nonzero]
         neigh_idx[i] = _idx
                 

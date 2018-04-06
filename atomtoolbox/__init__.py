@@ -1,8 +1,9 @@
 import numpy as np
 import pandas as pd
-from scipy import misc
+from scipy import misc, optimize
 import copy, itertools
 from ase.lattice.cubic import SimpleCubicFactory
+from ase.spacegroup import crystal as ase_crystal
 import matplotlib.pylab as plt
 
 from .spatial import get_ultracell, get_neighbors
@@ -17,7 +18,7 @@ from .misc import show_atoms, print_error_distributions_properties,\
     square_cluster_statistics
 
 
-from .features import make_array, get_crystal_design_matrix,\
+from .features import make_array, get_crystal_design_matrix, get_angles, get_q, get_q2, get_q3,\
     ThreeBodyAngleFeatures, BondOrderParameterFeatures,\
     taper_fun_wrapper, DistanceTaperingFeatures_2body, DistanceExpTaperingFeatures_2body,\
     DistanceCosTaperingFeatures_2body, DistanceCosExpTaperingFeatures_3body,\
@@ -25,7 +26,8 @@ from .features import make_array, get_crystal_design_matrix,\
     DistanceCosTapering_basis, DistanceCosTapering_basis_1stDerivative,\
     ElementCountFeatures, DistanceCosTaperingFeatures_3body, DistanceGaussTaperingFeatures_2body,\
     DistanceSineCosineTaperingFeatures_2body, DistanceSineCosineTapering_basis,\
-    DistanceGaussTapering_basis
+    DistanceGaussTapering_basis, DistancePolynomialTapering_basis, DistancePolynomialTaperingFeatures_2body,\
+    DistanceGenericTaperingFeatures_2body
 
 from .eam import get_rhos, get_r_and_dens_values,\
     get_embedding_density_functions, element_emb_filters, element_pair_filters,\
@@ -43,6 +45,9 @@ from .crystal import introduce_vacancies, thermal_vacancy_concentration,\
 
 from .diffusion import diffusion_solver, pde_measure_wrapper
 
+from .gap import get_GAP_matrix_v1, get_GAP_matrix_v2, get_kvec_v1, get_kvec_v2,\
+    GAPRegressor
+
 # from sklearn.model_selection import train_test_split
 # from sklearn.preprocessing import StandardScaler
 # from sklearn.datasets import make_moons, make_circles, make_classification
@@ -56,16 +61,42 @@ from .diffusion import diffusion_solver, pde_measure_wrapper
 # from sklearn.naive_bayes import GaussianNB
 # from sklearn.discriminant_analysis import QuadraticDiscriminantAnalysis
 
-def wrapper_optimize_cell(atoms):
+def wrapper_optimize_cell(atoms, kind="direct"):
+    """Wrapper for the optimization of crystal supercell boxes (cells).
+
+    Parameters
+    ----------
+    atoms : ase Atoms instance
+    kind : str, optional, default "direct"
+        Determines how "x" is interpreted by optimize_cell.
+        If kind = "direct" then x is interpreted as the diagional of the cell.
+        If kind = "factor" then x is interpreted as a factor of the individual
+        basis vectors.
+    """
+    assert kind in ["direct","factor"], "'kind' parameter not understood!"
     _atoms = copy.deepcopy(atoms)
     cell = _atoms.get_cell()
     fpos = _atoms.get_scaled_positions(wrap=True)
     
     diag = (np.array([0,1,2],dtype=int), np.array([0,1,2],dtype=int))
+    I = np.eye(3)
     def optimize_cell(x):
-        cell[diag] = x
-        _atoms.set_cell(cell)
-        _atoms.set_positions(np.dot(fpos,cell))
+        #cell[diag] = x
+        _I = I.copy()
+        if kind == "factor":
+            if isinstance(x,(float,int)) or (isinstance(x,(list,tuple,np.ndarray)) and len(x)==1):
+                _I[diag] = x
+            elif isinstance(x,(list,tuple,np.ndarray)) and len(x) == 3:
+                _I = np.diag(x)
+            else:
+                raise ValueError("'x' (%s) not understood!"%x)
+            _cell = _I.dot(cell)
+        elif kind == "direct":
+            _I[diag] = x
+            _cell = _I
+        
+        _atoms.set_cell(_cell)
+        _atoms.set_positions(np.dot(fpos,_cell))
         _atoms.set_scaled_positions(fpos)
         return _atoms.get_potential_energy()
     return optimize_cell
@@ -134,7 +165,8 @@ class CrystalRattler:
 
 def rattle_crystal_multiple_rvs(Nrattle, rattle_rvs, atoms, rpositions=None, 
                             Natoms=None, t_e=None, t_f=None, species=None,
-                            cells=None):
+                            cells=None, relax=False, relax_kwargs=dict(method="BFGS"),
+                            opt_cell_kind="iso", calculator=None):
     """Rattling a crystal with multiple rattle rvs.
 
     Can be called once or multiple times passing Natoms, t_e, t_f, species
@@ -228,6 +260,13 @@ def rattle_crystal_multiple_rvs(Nrattle, rattle_rvs, atoms, rpositions=None,
     ...                                atoms_dict[sname], rpositions=rpositions, Natoms=Natoms, t_e=t_e, t_f=t_f,\
     ...                                species=species, cells=cells)
     """
+    if not calculator is None:
+        try:
+            atoms.set_calculator(calculator)
+            e = atoms.get_potential_energy()
+            has_calc = True    
+        except:
+            has_calc = False
     try:
         e = atoms.get_potential_energy()
         has_calc = True
@@ -265,26 +304,64 @@ def rattle_crystal_multiple_rvs(Nrattle, rattle_rvs, atoms, rpositions=None,
     invcell = np.linalg.inv(cell)
 
     for i,CR in enumerate(CRs):
+        
         _rpositions = CR.run(atoms,N=Nrattle)
         _rpositions = get_wrapped_positions(_rpositions,cell)
+
+        if relax: # relaxing the cell
+            _cells = [None for v in range(Nrattle)]
+            for j in range(Nrattle):
+                _atoms = copy.deepcopy(atoms)
+                _atoms.set_positions(_rpositions[j])
+                opt_fun = wrapper_optimize_cell(_atoms,kind="factor")
+                if opt_cell_kind == "iso":
+                    _res = optimize.minimize(opt_fun,[1.],**relax_kwargs)
+                    _cells[j] = _res["x"]*cell
+                elif opt_cell_kind == "diag":
+                    _res = optimize.minimize(opt_fun,np.ones(3),**relax_kwargs)
+                    _cells[j] = np.diag(_res["x"]).dot(cell)
+                else:
+                    raise NotImplementedError
+                _atoms.set_cell(_cells[j])
+                _rpositions[j] = _atoms.get_positions(wrap=True)
+            #rpositions.append([_rpositions[j] for j in range(Nrattle)])
+            #cells.append(_cells)
+        else:
+            _cells = [cell for j in range(Nrattle)]
         rpositions.append(_rpositions)
-        cells.append([cell for v in range(Nrattle)])
+        cells.append(_cells)
+        
         _species = [atoms.get_chemical_symbols() for v in range(Nrattle)]
         species.append(_species)
         Natoms.append([atoms.positions.shape[0] for v in range(Nrattle)])
         
         if has_calc:
-            for j in range(_rpositions.shape[0]):
-                _pos = _rpositions[j,:,:]
+            # for i in range(len(CRs)):
+            #     print("E:i",i)
+            _t_e = [None for v in range(_rpositions.shape[0])]
+            _t_f = [None for v in range(_rpositions.shape[0])]
+            for j in range(len(_rpositions)):
+                _pos = _rpositions[j]
+                _cell = _cells[j]
+                _spec = _species[j]
+                
+                _inv_cell = np.linalg.inv(_cell)
 
-                _atoms = copy.deepcopy(atoms)
-                _fpos = np.dot(_pos,invcell)
-                _atoms.set_scaled_positions(_fpos)
-                _atoms.set_positions(_pos)
-                _t = _atoms.get_potential_energy()#/float(_fpos.shape[0])
-                #t_e.append([_t for v in range(_fpos.shape[0])])
-                t_e.append([_t])
-                t_f.append(_atoms.get_forces().ravel())
+                _atoms = ase_crystal(_spec, _pos.dot(_inv_cell), cell=_cell,
+                                    pbc=(1,1,1)) #copy.deepcopy(atoms)
+                if not calculator is None:
+                    _atoms.set_calculator(calculator)
+                else:
+                    _atoms.set_calculator(atoms.get_calculator())
+                #_fpos = np.dot(_pos,invcell)
+                #_atoms.set_scaled_positions(_fpos)
+                #_atoms.set_positions(_pos)
+                _t_e[j] = _atoms.get_potential_energy()#/float(_fpos.shape[0])
+                
+                _t_f[j] = _atoms.get_forces().ravel()
+            #t_e.append([_t for v in range(_fpos.shape[0])])
+            t_e.append(_t_e)
+            t_f.append(_t_f)
 
     if has_calc:
         return rpositions, Natoms, cells, species, t_e, t_f

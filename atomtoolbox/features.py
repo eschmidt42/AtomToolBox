@@ -58,7 +58,10 @@ def DistanceSineCosineTapering_basis(kappa_, taper_fun, der=0, dx=1e-6):
             if der == 0:
                 return np.sin(k*x)*taper_fun(x)
             elif der == 1:
-                return k*np.cos(k*x)*taper_fun(x) + np.sin(k*x)*misc.derivative(taper_fun, x, n=der, dx=dx)
+                try:
+                    return k*np.cos(k*x)*taper_fun(x) + np.sin(k*x)*taper_fun(x, der=1)
+                except TypeError:
+                    return k*np.cos(k*x)*taper_fun(x) + np.sin(k*x)*misc.derivative(taper_fun, x, n=der, dx=dx)
             else:
                 raise NotImplementedError("der = {} is not implemented!".format(der))
         return sine_fun
@@ -68,11 +71,32 @@ def DistanceSineCosineTapering_basis(kappa_, taper_fun, der=0, dx=1e-6):
             if der == 0:
                 return np.cos(k*x)*taper_fun(x)
             elif der == 1:
-                return -k*np.sin(k*x)*taper_fun(x) + np.cos(k*x)*misc.derivative(taper_fun, x, n=der, dx=dx)
+                try:
+                    return -k*np.sin(k*x)*taper_fun(x) + np.cos(k*x)*taper_fun( x, der=1)
+                except TypeError:
+                    return -k*np.sin(k*x)*taper_fun(x) + np.cos(k*x)*misc.derivative(taper_fun, x, n=der, dx=dx)
             else:
                 raise NotImplementedError("der = {} is not implemented!".format(der))
         return cosine_fun
     return [wrapped_cosine(k) for k in kappa] + [wrapped_sine(k) for k in kappa]
+
+def DistancePolynomialTapering_basis(kappa_, taper_fun, der=0, dx=1e-6, enforce_int=True):
+    from atomtoolbox.features import make_array
+    dtype = int if enforce_int else float
+    kappa = make_array(kappa_, dtype=dtype)
+    def wrapped_poly(k):
+        def poly_fun(x):
+            if der == 0:
+                return (x**k)*taper_fun(x)
+            elif der == 1:
+                try:
+                    return k*(x**(k-1))*taper_fun(x) + (x**k)*taper_fun(x, der=1)
+                except TypeError:
+                    return k*(x**(k-1))*taper_fun(x) + (x**k)*misc.derivative(taper_fun, x, n=der, dx=dx)
+            else:
+                raise NotImplementedError("der = {} is not implemented!".format(der))
+        return poly_fun
+    return [wrapped_poly(k) for k in kappa]
 
 def get_angles(r_vec):
     # theta
@@ -131,7 +155,8 @@ def get_crystal_design_matrix(positions=None, species=None, cell=None, atoms=Non
     Notes
     -----
     r_cut always needs to be different than None, even if the num_neigh parameter is
-    not equal to None.
+    not equal to None. Also, if both r_cut and num_neigh are given then num_neigh precedes
+    r_cut.
     """
     assert not r_cut is None and isinstance(r_cut,(float,int)), "Error 'r_cut' has to be given as either a float or int value."
     assert all([not positions is None, not species is None, not cell is None]) or not atoms is None, "Either 'cell', 'positions' and 'species' need to be given or 'atoms'."
@@ -462,13 +487,16 @@ class BondOrderParameterFeatures(sklearn.base.BaseEstimator, sklearn.base.Transf
     name = "BondOrderParameterFeatures"
     dt_q = 0
     
-    def __init__(self, k=[4,6], element_filter=None, tol0=1e-6, kind="3", **kwargs):
-        self.k = k
+    def __init__(self, k=[4,6], element_filter=None, tol0=1e-6, kind="3", kappa_=None,
+                 compute_ws=False, **kwargs):
+        self.k = make_array(k, dtype=int)
         self.element_filter = element_filter
         self.tol0 = tol0
         
         self.m_range_dict = {l:np.arange(-l,l+1) for l in self.k}
         self.factor_dict = {l:4*np.pi/(2.*l+1) for l in self.k}
+        self.kappa_ = kappa_ if kappa_ is None else make_array(kappa_, dtype=float)
+        self.compute_ws = compute_ws
         
         assert kind in ["1", "2", "3"], "'kind' ({}) not understood!".format(kind)
         self.kind = kind
@@ -476,10 +504,11 @@ class BondOrderParameterFeatures(sklearn.base.BaseEstimator, sklearn.base.Transf
     @staticmethod
     def _get_bops(i, X, species, uX, uspecies, idx_neigh, k=[4,6],
                   element_filter=None, tol0=1e-6, m_range_dict=None, 
-                  factor_dict=None):
+                  factor_dict=None, compute_ws=False):
         """Computes the bond order paramters.
         """
-        
+        if self.compute_ws:
+            raise NotImplementedError
         n_q = len(k)
         qs = np.zeros(n_q)
                           
@@ -518,10 +547,11 @@ class BondOrderParameterFeatures(sklearn.base.BaseEstimator, sklearn.base.Transf
     @staticmethod
     def _get_bops2(i, X, species, uX, uspecies, idx_neigh, k=[4,6],
                   element_filter=None, tol0=1e-6, m_range_dict=None, 
-                  factor_dict=None):
+                  factor_dict=None, compute_ws=False):
         """Computes the bond order paramters.
         """
-        
+        if self.compute_ws:
+            raise NotImplementedError
         n_q = len(k)
         qs = np.zeros(n_q)
                           
@@ -561,13 +591,19 @@ class BondOrderParameterFeatures(sklearn.base.BaseEstimator, sklearn.base.Transf
     @staticmethod
     def _get_bops3(X, species, uX, uspecies, idx_neigh, k=[4,6],
                   element_filter=None, tol0=1e-6, m_range_dict=None, 
-                  factor_dict=None):
+                  factor_dict=None,kappa_=None, compute_ws=False):
         """Computes the bond order paramters.
         """
-        
+        import spherical_functions as sf
         n_q = len(k)
         qs = np.zeros((X.shape[0],n_q),dtype=float)
+        
         qs_dict = {l: np.zeros((X.shape[0], len(m_range_dict[l])),dtype=complex) for l in k}
+        if compute_ws:
+            ws = qs.copy()
+                
+            wigner3js = {l: {(m1,m2,m3): sf.Wigner3j(l,l,l,m1,m2,m3) for (m1,m2,m3) in \
+                             itertools.product(m_range_dict[l],m_range_dict[l],m_range_dict[l])} for l in m_range_dict}
                         
         for i in range(X.shape[0]):
             # current atom
@@ -604,7 +640,36 @@ class BondOrderParameterFeatures(sklearn.base.BaseEstimator, sklearn.base.Transf
             assert np.isfinite(qs_dict[l]).all(), "qs_dict[{}] contains non-finite values.".format(l)
             qs[:,j] = (np.absolute(qs_dict[l])**2).sum(axis=1)
             qs[:,j] = np.sqrt(factor_dict[l]*qs[:,j])
-         
+            
+            if compute_ws:
+                ix = range(m_range_dict[l].shape[0])
+                _ijk = itertools.product(ix,ix,ix)
+                m = m_range_dict[l]
+                
+                tmp = np.array([wigner3js[l][(m[_i],m[_j],m[_k])]*qs_dict[l][:,_i]*qs_dict[l][:,_j]*qs_dict[l][:,_k]
+                                for _i,_j,_k in _ijk]).sum(axis=0)
+                tmp /= (np.absolute(qs_dict[l])**2).sum(axis=1)**1.5
+                
+                ws[:,j] = tmp.real
+                if (tmp.imag>1e-8).any():
+                    raise ValueError("Found non vanishing imaginary part for W ({})!".format(tmp))
+                
+            
+        if kappa_ is not None:
+            m = kappa_.shape[0]
+            vals = np.zeros((X.shape[0],n_q*2*m),dtype=float)
+            F = lambda q_: np.array([np.cos(k_*q_) for k_ in range(m)] + [np.sin(k_*q_) for k_ in range(m)])
+            for j,l in enumerate(k):
+                vals[:,j*2*m:(j+1)*2*m] = F(qs[:,j]).T
+
+            if compute_ws:
+                w_vals = np.zeros((X.shape[0],n_q*2*m),dtype=float)
+                for j,l in enumerate(k):
+                    w_vals[:,j*2*m:(j+1)*2*m] = F(ws[:,j]).T
+                return np.hstack((vals,w_vals))
+            return vals
+        if compute_ws:
+            return np.hstack((qs,ws))
         return qs
         
     def fit(self, X, species, uX, uspecies, idx_neigh, y=None):
@@ -634,7 +699,10 @@ class BondOrderParameterFeatures(sklearn.base.BaseEstimator, sklearn.base.Transf
         n_samples, n_features = utils.check_array(X).shape
         self.n_input_features_ = n_features
         
-        self.n_output_features_ = len(self.k)
+        if self.compute_ws:
+            self.n_output_features_ = len(self.k)*2 if self.kappa_ is None else self.k.shape[0]*2*self.kappa_.shape[0]*2
+        else:
+            self.n_output_features_ = len(self.k) if self.kappa_ is None else self.k.shape[0]*2*self.kappa_.shape[0]
         return self
     
     def transform(self, X, species, uX, uspecies, uidx_neigh):
@@ -681,20 +749,23 @@ class BondOrderParameterFeatures(sklearn.base.BaseEstimator, sklearn.base.Transf
             for i in range(n_samples):
                 qs = self._get_bops(i, X, species, uX, uspecies, uidx_neigh, 
                                     k=self.k, tol0=self.tol0, m_range_dict=self.m_range_dict,
-                                    factor_dict=self.factor_dict, element_filter=self.element_filter)
+                                    factor_dict=self.factor_dict, element_filter=self.element_filter,
+                                    compute_ws=self.compute_ws)
                 XP[i,:] = qs
           
         elif self.kind == "2":
             for i in range(n_samples):
                 qs = self._get_bops2(i, X, species, uX, uspecies, uidx_neigh, 
-                                    k=self.k, tol0=self.tol0, m_range_dict=self.m_range_dict,
-                                    factor_dict=self.factor_dict, element_filter=self.element_filter)
+                                     k=self.k, tol0=self.tol0, m_range_dict=self.m_range_dict,
+                                     factor_dict=self.factor_dict, element_filter=self.element_filter, 
+                                     compute_ws=self.compute_ws)
                 XP[i,:] = qs
         
         elif self.kind == "3":
             XP = self._get_bops3(X, species, uX, uspecies, uidx_neigh, 
-                                    k=self.k, tol0=self.tol0, m_range_dict=self.m_range_dict,
-                                    factor_dict=self.factor_dict, element_filter=self.element_filter)
+                                 k=self.k, tol0=self.tol0, m_range_dict=self.m_range_dict,
+                                 factor_dict=self.factor_dict, element_filter=self.element_filter,
+                                 kappa_=self.kappa_, compute_ws=self.compute_ws)
         else:
             raise ValueError("Do not understand 'kind' = '{}'".format(kind))
         assert np.isfinite(XP).all(), "XP contains non-finite values."
@@ -708,17 +779,31 @@ class BondOrderParameterFeatures(sklearn.base.BaseEstimator, sklearn.base.Transf
 
 def taper_fun_wrapper(_type="x4ge",**kwargs):
     if _type=="x4ge":
-        def x4_fun(x):
+        def x4_fun(x, der=0):
             x4 = ((x-kwargs["a"])/float(kwargs["b"]))**4
             x4[x>=kwargs["a"]] = 0
-            return x4/(1.+x4)
+            if der == 0:
+                return x4/(1.+x4)
+            elif der == 1:
+                x3 = ((x-kwargs["a"])/float(kwargs["b"]))**3
+                x3[x>=kwargs["a"]] = 0
+                return 4*x3/((1+x4)**2) /float(kwargs["b"])
+            else:
+                raise NotImplementedError
         return x4_fun
     
     elif _type=="x4le":
         def x4_fun(x):
             x4 = ((x-kwargs["a"])/float(kwargs["b"]))**4
             x4[x<=kwargs["a"]] = 0
-            return x4/(1.+x4)
+            if der == 0:
+                return x4/(1.+x4)
+            elif der == 1:
+                x3 = ((x-kwargs["a"])/float(kwargs["b"]))**3
+                x3[x<=kwargs["a"]] = 0
+                return 4*x3/((1+x4)**2) /float(kwargs["b"])
+            else:
+                raise NotImplementedError
         return x4_fun
     
     elif _type=="Behlerge":
@@ -834,7 +919,7 @@ class DistanceTaperingFeatures_2body(sklearn.base.BaseEstimator, sklearn.base.Tr
         dr = uatoms-atom
         r = np.linalg.norm(dr,axis=1)
         if return_force:
-            f = misc.derivative(taper_fun,r,dx=1.,n=1) * 1./r * dr.T
+            f = misc.derivative(taper_fun, r, dx=1., n=1) * 1./r * dr.T
             return taper_fun(r).sum(), f.sum(axis=1)
         else:
             return taper_fun(r).sum()
@@ -2638,10 +2723,17 @@ class DistanceGaussTaperingFeatures_2body(sklearn.base.BaseEstimator, sklearn.ba
         if return_force:
             
             if do_emb:
-                dens_fp = misc.derivative(taper_fun_emb, dens, dx=1, n=1)
-                udens_fp = misc.derivative(taper_fun_emb, udens, dx=1, n=1)
+                try:
+                    dens_fp = taper_fun_emb(dens, der=1)
+                    udens_fp = taper_fun_emb(udens, der=1)
+                except:
+                    dens_fp = misc.derivative(taper_fun_emb, dens, dx=1, n=1)
+                    udens_fp = misc.derivative(taper_fun_emb, udens, dx=1, n=1)
             
-            fp = misc.derivative(taper_fun, r, dx=1, n=1)
+            try:
+                fp = taper_fun(r, der=1)
+            except:
+                fp = misc.derivative(taper_fun, r, dx=1, n=1)
             dr_normed = (dr.T/r)
         
         if do_emb: # embedding density version
@@ -2650,10 +2742,10 @@ class DistanceGaussTaperingFeatures_2body(sklearn.base.BaseEstimator, sklearn.ba
             #forces = np.zeros((3,Np*Nq*Nspec))        
             #idx_dict_species = {k:np.arange(Np*Nq*v, Np*Nq*(v+1)) for v,k in enumerate(species_order)}
             
-            forces = np.zeros((3,Np*Nq))
-            vals = np.zeros(Np*Nq)
-            _forces = np.zeros((3,Np*Nq))
-            _vals = np.zeros(Np*Nq)
+            forces = np.zeros((3,Np*Nq), dtype=np.float64)
+            vals = np.zeros(Np*Nq, dtype=np.float64)
+            _forces = np.zeros((3,Np*Nq), dtype=np.float64)
+            _vals = np.zeros(Np*Nq, dtype=np.float64)
             
             if spec == emb_spec:
                 # current atom - looping all basis functions
@@ -2682,7 +2774,7 @@ class DistanceGaussTaperingFeatures_2body(sklearn.base.BaseEstimator, sklearn.ba
                 for i_el, _spec in enumerate(uspecs):
                     if _spec != emb_spec:
                         continue
-                    _forces[:,:] = 0
+                    _forces[:,:] = 0.
                     
                     _dens = udens[i_el]
                     _dens_f = udens_f[i_el]
@@ -2705,8 +2797,8 @@ class DistanceGaussTaperingFeatures_2body(sklearn.base.BaseEstimator, sklearn.ba
                     
         else: # pair distance version
             
-            vals = np.zeros(Np*Nq)
-            forces = np.zeros((3,Np*Nq))        
+            vals = np.zeros(Np*Nq, dtype=np.float64)
+            forces = np.zeros((3,Np*Nq), dtype=np.float64)        
             
             for _ip in range(Np):
                 for _iq in range(Nq):
@@ -2876,7 +2968,7 @@ class DistanceSineCosineTaperingFeatures_2body(sklearn.base.BaseEstimator, sklea
     
     def __init__(self, taper_type=None, taper_fun=None, element_filter=None,\
                  kappa_=1, return_force=False, emb_density_funs=None,\
-                 taper_fun_emb=None, tol0=1e-6, **kwargs):
+                 taper_fun_emb=None, tol0=1e-6, dx=1e-6, **kwargs):
         
         assert not all([taper_type is None, taper_fun is None]), "Either taper_type or taper_fun need to be provided."
         
@@ -2900,12 +2992,13 @@ class DistanceSineCosineTaperingFeatures_2body(sklearn.base.BaseEstimator, sklea
         
         self.emb_density_funs = emb_density_funs
         self.taper_fun_emb = taper_fun_emb
+        self.dx = dx
         
     @staticmethod
     def _get_Gvalue(i, X, species, uX, uspecies, idx_neigh, 
                     element_filter=None, taper_fun=None, kappa_=[1.], 
                     return_force=False, emb_density_funs=None, taper_fun_emb=None,
-                    rhos=None, urhos=None, tol0=1e-6):
+                    rhos=None, urhos=None, tol0=1e-6, dx=1e-6):
         """Computes G values.
         """
         assert callable(taper_fun), "taper_fun needs to be callable."
@@ -2978,10 +3071,17 @@ class DistanceSineCosineTaperingFeatures_2body(sklearn.base.BaseEstimator, sklea
         if return_force:
             
             if do_emb:
-                dens_fp = misc.derivative(taper_fun_emb, dens, dx=1, n=1)
-                udens_fp = misc.derivative(taper_fun_emb, udens, dx=1, n=1)
+                try:
+                    dens_fp = taper_fun_emb(dens, der=1)
+                    udens_fp = misc.derivative(udens, der=1)
+                except TypeError:
+                    dens_fp = misc.derivative(taper_fun_emb, dens, dx=dx, n=1)
+                    udens_fp = misc.derivative(taper_fun_emb, udens, dx=dx, n=1)
             
-            fp = misc.derivative(taper_fun, r, dx=1, n=1)
+            try:
+                fp = taper_fun(r, der=1)
+            except TypeError:
+                fp = misc.derivative(taper_fun, r, dx=dx, n=1)
             dr_normed = (dr.T/r)
         
         if do_emb: # embedding density version
@@ -2992,9 +3092,9 @@ class DistanceSineCosineTaperingFeatures_2body(sklearn.base.BaseEstimator, sklea
             
             #_forces = np.zeros((3,N))
             #_vals = np.zeros(N)
-            forces = np.zeros((3,N))
-            vals = np.zeros(N)
-            _forces = np.zeros((3,N))
+            forces = np.zeros((3,N), dtype=np.float64)
+            vals = np.zeros(N, dtype=np.float64)
+            _forces = np.zeros((3,N), dtype=np.float64)
             
             if not spec == emb_spec:
                 # current atom - looping all basis functions
@@ -3054,8 +3154,8 @@ class DistanceSineCosineTaperingFeatures_2body(sklearn.base.BaseEstimator, sklea
                     
         else: # pair distance version
             
-            vals = np.zeros(N)
-            forces = np.zeros((3,N))        
+            vals = np.zeros(N, dtype=np.float64)
+            forces = np.zeros((3,N), dtype=np.float64)        
             
             for i in range(N):
                 
@@ -3162,7 +3262,7 @@ class DistanceSineCosineTaperingFeatures_2body(sklearn.base.BaseEstimator, sklea
                                      return_force=self.return_force, 
                                      emb_density_funs=self.emb_density_funs, 
                                      taper_fun_emb=self.taper_fun_emb, rhos=rhos,
-                                     urhos=urhos, tol0=self.tol0)
+                                     urhos=urhos, tol0=self.tol0, dx=self.dx)
                 XP_f[3*i:3*(i+1),:] = G_f
             else:
                 G = self._get_Gvalue(i, X, species, uX, uspecies, uidx_neigh,  
@@ -3171,7 +3271,702 @@ class DistanceSineCosineTaperingFeatures_2body(sklearn.base.BaseEstimator, sklea
                                      return_force=self.return_force,
                                      emb_density_funs=self.emb_density_funs, 
                                      taper_fun_emb=self.taper_fun_emb, rhos=rhos,
-                                     urhos=urhos, tol0=self.tol0)
+                                     urhos=urhos, tol0=self.tol0, dx=self.dx)
+            
+            XP[i,:] = G
+        if self.return_force:
+            return XP, XP_f
+        else:
+            return XP
+    
+    def fit_transform(self, X, species, uX, uspecies, uidx_neigh, rhos=None,\
+                      urhos=None, **kwargs):
+        """Calls fit and transform on X, species, uX, uspecies, uidx_neigh.
+        """
+        self.fit(X, species, uX, uspecies, uidx_neigh)
+        return self.transform(X, species, uX, uspecies, uidx_neigh, rhos=rhos, urhos=urhos)
+
+class DistancePolynomialTaperingFeatures_2body(sklearn.base.BaseEstimator, sklearn.base.TransformerMixin):
+    """Generate polynomial features which taper based on 2-body distances.
+
+    Generate a design matrix using a distance tapering function f
+    for individual atoms:
+    
+    G_i = sum_j r_ij**kappa * f(r_ij)
+
+    Parameters
+    ----------
+    taper_fun : callable
+        Custom tapering function.
+        
+    taper_type : str
+        Type of tapering function to be used.
+        
+    kappa_ : int, float, list, tuple or np.ndarray of length N
+                
+    element_filter : callable, optional, default None
+        Function to filter neighboring elements. Has to return True
+        to keep the element and False to remove it.
+    
+    tol0 : float, optional, default 1e-6
+        Minimum distance for r>0 checks to prevent the appearance of
+        unphysical distances of, for example, 1e-22.
+
+    Example
+    --------
+    >>> all_filter = lambda s,s_ref: np.array([True for v in range(s.shape[0])])
+    >>> taper_fun_params = dict(a=r_cut,b=1)
+    >>> taper_fun = taper_fun_wrapper(_type="x4le",**taper_fun_params)
+
+    >>> DscTF_all = DistanceSineCosineTaperingFeatures_2body(element_filter=all_filter,
+                                            taper_fun=taper_fun, kappa_=[1.,2.])
+
+    >>> Phi_all = DscTF_all.fit_transform(positions, species, upositions, uspecies, 
+                                   uindices_neigh)
+    
+    """
+    
+    name = "DistancePolynomialTaperingFeatures_2body"
+    implemented_taper_fun_types = dict()
+    
+    def __init__(self, taper_type=None, taper_fun=None, element_filter=None,\
+                 kappa_=1, return_force=False, emb_density_funs=None,\
+                 taper_fun_emb=None, tol0=1e-6, dx=1e-6, enforce_int=True, **kwargs):
+        
+        assert not all([taper_type is None, taper_fun is None]), "Either taper_type or taper_fun need to be provided."
+        
+        if not taper_fun is None:
+            assert callable(taper_fun), "Given taper_fun parameter needs to be callable."
+            taper_type = "custom"
+        elif not taper_type is None:
+            assert taper_type in self.implemented_taper_fun_types, "Given taper_type ('{}') not understood.".format(taper_type)
+            taper_fun = self.implemented_taper_fun_types[taper_type]
+        
+        self.tol0 = tol0
+        self.dx = dx
+        
+        self.taper_type = taper_type
+        self.taper_fun = taper_fun
+        self.element_filter = element_filter
+        
+        dtype = int if enforce_int else float
+        self.kappa_ = make_array(kappa_, dtype=dtype)
+        self.N = self.kappa_.shape[0]
+        self.return_force = return_force  
+        
+        self.emb_density_funs = emb_density_funs
+        self.taper_fun_emb = taper_fun_emb
+        
+    @staticmethod
+    def _get_Gvalue(i, X, species, uX, uspecies, idx_neigh, 
+                    element_filter=None, taper_fun=None, kappa_=[1.], 
+                    return_force=False, emb_density_funs=None, taper_fun_emb=None,
+                    rhos=None, urhos=None, tol0=1e-6, dx=1e-6):
+        """Computes G values.
+        """
+        assert callable(taper_fun), "taper_fun needs to be callable."
+        
+        do_emb = False # whether or not to compute the embedding density (in the case of EAM)
+        do_taper_emb = False # whether or not to taper the embedding density
+        if not emb_density_funs is None:
+            do_emb = True
+            do_taper_emb = not taper_fun_emb is None
+            assert isinstance(emb_density_funs,dict), "Expected the provided 'emb_density_funs' parameter to be a dict."
+            assert all([callable(v) for v in emb_density_funs.values()]), "Expected the provided the values of the 'emb_density_funs' parameter to be callable."
+            assert all([not rhos is None, not urhos is None]), "In order to compute embedding density based features 'rhos' and 'urhos' need to be provided."
+            
+            species_order = sorted(list(emb_density_funs))
+            
+        if all([not rhos is None, not urhos is None]) and not do_emb:
+            raise ValueError("'rhos' and 'urhos' are given but not 'emb_density_funs'!")
+                            
+        # current atom
+        atom = X[i,:]
+        spec = species[i]
+
+        #neighboring atoms
+        uidx = idx_neigh[i]
+        assert len(uidx) > 0, "No neighbors available for current atom!"
+            
+        if callable(element_filter):
+            uidx = uidx[element_filter(uspecies[uidx],spec)]
+        if do_emb:
+            assert isinstance(element_filter,str), "For embedding density features the parameter 'element_filter' needs to be a string! Given: {}".format(element_filter)
+            emb_spec = element_filter # in case of embedding density the element_filter is just a string
+
+        uatoms = uX[uidx]
+        uspecs = uspecies[uidx]
+        if do_emb:
+            udens = urhos[uidx]
+        n_neigh = len(uidx)
+
+        dr = uatoms-atom
+        r = np.linalg.norm(dr,axis=1)
+        
+        # re-do neighborhood for valid r (just to be safe)
+        r_valid = np.where(r>tol0)[0]
+        uidx = uidx[r_valid]
+        
+        dr = dr[r_valid]
+        r = r[r_valid]
+        if do_emb:
+            udens = udens[r_valid]
+        n_neigh = len(uidx)
+        
+        if do_emb:
+            dens = rhos[i]
+            
+        if do_emb:
+            
+            if do_taper_emb:
+                udens_f = taper_fun_emb(udens)
+                dens_f = taper_fun_emb(dens)
+                
+            else:
+                taper_fun_emb = lambda x: 1. if isinstance(x,float) else np.ones(x.shape)
+                udens_f = taper_fun_emb(udens)
+                dens = taper_fun_emb(dens)
+        
+        f = taper_fun(r)
+        N = len(kappa_)
+                
+        if return_force:
+            
+            if do_emb:
+                
+                try:
+                    dens_fp = taper_fun_emb(dens, der=1)
+                    udens_fp = taper_fun_emb(udens, der=1)
+                except TypeError:
+                    dens_fp = misc.derivative(taper_fun_emb, dens, dx=dx, n=1)
+                    udens_fp = misc.derivative(taper_fun_emb, udens, dx=dx, n=1)
+            
+            try:
+                fp = taper_fun(r, der=1)
+            except TypeError:
+                fp = misc.derivative(taper_fun, r, dx=dx, n=1)
+            dr_normed = (dr.T/r)
+        
+        if do_emb: # embedding density version
+            #Nspec = len(species_order)
+            #vals = np.zeros(N*Nspec)
+            #forces = np.zeros((3,N*Nspec))        
+            #idx_dict_species = {k:np.arange(N*v,N*(v+1)) for v,k in enumerate(species_order)}
+            
+            #_forces = np.zeros((3,N))
+            #_vals = np.zeros(N)
+            forces = np.zeros((3,N), dtype=np.float64)
+            vals = np.zeros(N, dtype=np.float64)
+            _forces = np.zeros((3,N), dtype=np.float64)
+            
+            if not spec == emb_spec:
+                # current atom - looping all basis functions
+                for _i in range(N):
+                    
+                    
+                    c = dens**kappa_[_i]
+                    vals[_i] = c*dens_f
+
+                    if return_force:
+                        
+                        cp = kappa_[_i]*dens**(kappa_[_i]-1)
+                            
+                        _f = (cp*dens_f+c*dens_fp) * fp * dr_normed
+
+                        _forces[:,_i] = _f.sum(axis=1)
+            
+            if return_force:
+               #forces[:,idx_dict_species[spec]] += _forces
+               forces += _forces
+            #vals[idx_dict_species[spec]] += _vals
+            
+            if return_force:
+                
+                # looping all neighbors
+                for i_el, _spec in enumerate(uspecs):
+                    if _spec != emb_spec:
+                        continue
+                    _forces[:,:] = 0.
+                    
+                    _dens = udens[i_el]
+                    _dens_f = udens_f[i_el]
+                    
+                    _dens_fp = udens_fp[i_el]
+                    _fp = fp[i_el]
+                    
+                    # looping all basis functions
+                    for _i in range(N):
+                        
+                        
+                        c = _dens**kappa_[_i]
+                        cp = kappa_[_i]*_dens**(kappa_[_i]-1)
+                        
+                        _f = (cp*_dens_f+c*_dens_fp) * _fp * dr_normed[:,i_el]
+                        _forces[:,_i] = _f
+                        
+                    #forces[:,idx_dict_species[_spec]] += _forces
+                    forces += _forces
+                    
+        else: # pair distance version
+            
+            vals = np.zeros(N, dtype=np.float64)
+            forces = np.zeros((3,N), dtype=np.float64)        
+            
+            for i in range(N):
+                
+                c = r**kappa_[i]
+                vals[i] = (c*f).sum()
+                
+                if return_force:
+                    
+                    cp = kappa_[i]*r**kappa_[i]
+                    _f = (cp*f + c*fp) * dr_normed
+
+                    forces[:,i] = _f.sum(axis=1)
+        
+        if return_force:
+            return vals, forces
+        else:
+            return vals
+        
+    def fit(self, X, species, uX, uspecies, idx_neigh, y=None):
+        """Compute number of output features.
+
+        Parameters
+        ----------
+        X : array-like, shape (n_atoms, 3)
+            The supercell atom positions.
+        
+        species : np.ndarray of str of shape (n_atoms,)
+            atom species in the supercell
+        
+        uX : array-like, shape (n_ultra_atoms, 3)
+            The ultracell atom positions.
+            
+        uspecies : np.ndarray of str of shape (n_atoms,)
+            atom species in the ultracell
+        
+        idx_neigh : list of np.ndarrays of int
+            indices connecting each atom in X with its neighbors in uX
+            
+        Returns
+        -------
+        self : instance
+        """
+        n_samples, n_features = utils.check_array(X).shape
+        self.n_input_features_ = n_features
+        
+        self.n_output_features_ = self.N
+        #if not self.emb_density_funs is None:
+        #    self.n_output_features_ = self.N*len(self.emb_density_funs)
+        return self
+    
+    def transform(self, X, species, uX, uspecies, uidx_neigh, rhos=None, urhos=None):
+        """Computes the histograms.
+
+        Parameters
+        ----------
+        X : array-like, shape (n_atoms, 3)
+            The supercell atom positions.
+        
+        species : np.ndarray of str of shape (n_atoms,)
+            atom species in the supercell
+        
+        uX : array-like, shape (n_ultra_atoms, 3)
+            The ultracell atom positions.
+            
+        uspecies : np.ndarray of str of shape (n_atoms,)
+            atom species in the ultracell
+        
+        idx_neigh : list of np.ndarrays of int
+            indices connecting each atom in X with its neighbors in uX
+
+        Returns
+        -------
+        XP : np.ndarray of shape (n_samples, n_output_features)
+            The design matrix.
+
+        Note
+        ----
+        Requires prior execution of self.fit.
+        """
+        sklearn.utils.validation.check_is_fitted(self, ['n_input_features_', 'n_output_features_'])
+
+        X = sklearn.utils.validation.check_array(X, dtype=sklearn.utils.validation.FLOAT_DTYPES)
+        n_samples, n_features = X.shape
+
+        if n_features != self.n_input_features_:
+            raise ValueError("X shape does not match training shape")
+
+        # allocate output data
+        XP = np.empty((n_samples, self.n_output_features_), dtype=X.dtype)
+        if self.return_force:
+            XP_f = np.empty((3*n_samples, self.n_output_features_), dtype=X.dtype)
+        
+        for i in range(n_samples):
+            if self.return_force:
+                G, G_f = self._get_Gvalue(i, X, species, uX, uspecies, uidx_neigh,  
+                                     element_filter=self.element_filter, 
+                                     taper_fun=self.taper_fun, kappa_=self.kappa_, 
+                                     return_force=self.return_force, 
+                                     emb_density_funs=self.emb_density_funs, 
+                                     taper_fun_emb=self.taper_fun_emb, rhos=rhos,
+                                     urhos=urhos, tol0=self.tol0, dx=self.dx)
+                XP_f[3*i:3*(i+1),:] = G_f
+            else:
+                G = self._get_Gvalue(i, X, species, uX, uspecies, uidx_neigh,  
+                                     element_filter=self.element_filter, 
+                                     taper_fun=self.taper_fun, kappa_=self.kappa_, 
+                                     return_force=self.return_force,
+                                     emb_density_funs=self.emb_density_funs, 
+                                     taper_fun_emb=self.taper_fun_emb, rhos=rhos,
+                                     urhos=urhos, tol0=self.tol0, dx=self.dx)
+            
+            XP[i,:] = G
+        if self.return_force:
+            return XP, XP_f
+        else:
+            return XP
+    
+    def fit_transform(self, X, species, uX, uspecies, uidx_neigh, rhos=None,\
+                      urhos=None, **kwargs):
+        """Calls fit and transform on X, species, uX, uspecies, uidx_neigh.
+        """
+        self.fit(X, species, uX, uspecies, uidx_neigh)
+        return self.transform(X, species, uX, uspecies, uidx_neigh, rhos=rhos, urhos=urhos)
+
+class DistanceGenericTaperingFeatures_2body(sklearn.base.BaseEstimator, sklearn.base.TransformerMixin):
+    """Generate features based on generic functions which taper based on 2-body distances.
+
+    Generate a design matrix using a distance tapering function f
+    for individual atoms:
+    
+    G_i = sum_j g(r_ij) * f(r_ij)
+
+    Parameters
+    ----------
+    taper_fun : callable
+        Custom tapering function.
+        
+    taper_type : str
+        Type of tapering function to be used.
+        
+    kappa_ : int, float, list, tuple or np.ndarray of length N
+                
+    element_filter : callable, optional, default None
+        Function to filter neighboring elements. Has to return True
+        to keep the element and False to remove it.
+    
+    tol0 : float, optional, default 1e-6
+        Minimum distance for r>0 checks to prevent the appearance of
+        unphysical distances of, for example, 1e-22.
+
+    Example
+    --------
+    >>> all_filter = lambda s,s_ref: np.array([True for v in range(s.shape[0])])
+    >>> taper_fun_params = dict(a=r_cut,b=1)
+    >>> taper_fun = taper_fun_wrapper(_type="x4le",**taper_fun_params)
+
+    >>> DscTF_all = DistanceSineCosineTaperingFeatures_2body(element_filter=all_filter,
+                                            taper_fun=taper_fun, kappa_=[1.,2.])
+
+    >>> Phi_all = DscTF_all.fit_transform(positions, species, upositions, uspecies, 
+                                   uindices_neigh)
+    
+    """
+    
+    name = "DistanceGenericTaperingFeatures_2body"
+    implemented_taper_fun_types = dict()
+    
+    def __init__(self, taper_type=None, taper_fun=None, element_filter=None,\
+                 kappa_=1, return_force=False, emb_density_funs=None,\
+                 taper_fun_emb=None, tol0=1e-6, dx=1e-6, enforce_int=True, **kwargs):
+        
+        assert not all([taper_type is None, taper_fun is None]), "Either taper_type or taper_fun need to be provided."
+        
+        if not taper_fun is None:
+            assert callable(taper_fun), "Given taper_fun parameter needs to be callable."
+            taper_type = "custom"
+        elif not taper_type is None:
+            assert taper_type in self.implemented_taper_fun_types, "Given taper_type ('{}') not understood.".format(taper_type)
+            taper_fun = self.implemented_taper_fun_types[taper_type]
+        
+        self.tol0 = tol0
+        self.dx = dx
+        
+        self.taper_type = taper_type
+        self.taper_fun = taper_fun
+        self.element_filter = element_filter
+        
+        self.kappa_ = make_array(kappa_, dtype=object)
+        self.N = self.kappa_.shape[0]
+        self.return_force = return_force
+        
+        self.emb_density_funs = emb_density_funs
+        self.taper_fun_emb = taper_fun_emb
+        
+    @staticmethod
+    def _get_Gvalue(i, X, species, uX, uspecies, idx_neigh, 
+                    element_filter=None, taper_fun=None, kappa_=[1.], 
+                    return_force=False, emb_density_funs=None, taper_fun_emb=None,
+                    rhos=None, urhos=None, tol0=1e-6, dx=1e-6):
+        """Computes G values.
+        """
+        assert callable(taper_fun), "taper_fun needs to be callable."
+        
+        do_emb = False # whether or not to compute the embedding density (in the case of EAM)
+        do_taper_emb = False # whether or not to taper the embedding density
+        if not emb_density_funs is None:
+            do_emb = True
+            do_taper_emb = not taper_fun_emb is None
+            assert isinstance(emb_density_funs,dict), "Expected the provided 'emb_density_funs' parameter to be a dict."
+            assert all([callable(v) for v in emb_density_funs.values()]), "Expected the provided the values of the 'emb_density_funs' parameter to be callable."
+            assert all([not rhos is None, not urhos is None]), "In order to compute embedding density based features 'rhos' and 'urhos' need to be provided."
+            
+            species_order = sorted(list(emb_density_funs))
+            
+        if all([not rhos is None, not urhos is None]) and not do_emb:
+            raise ValueError("'rhos' and 'urhos' are given but not 'emb_density_funs'!")
+                            
+        # current atom
+        atom = X[i,:]
+        spec = species[i]
+
+        #neighboring atoms
+        uidx = idx_neigh[i]
+        assert len(uidx) > 0, "No neighbors available for current atom!"
+            
+        if callable(element_filter):
+            uidx = uidx[element_filter(uspecies[uidx],spec)]
+        if do_emb:
+            assert isinstance(element_filter,str), "For embedding density features the parameter 'element_filter' needs to be a string! Given: {}".format(element_filter)
+            emb_spec = element_filter # in case of embedding density the element_filter is just a string
+
+        uatoms = uX[uidx]
+        uspecs = uspecies[uidx]
+        if do_emb:
+            udens = urhos[uidx]
+        n_neigh = len(uidx)
+
+        dr = uatoms-atom
+        r = np.linalg.norm(dr,axis=1)
+        
+        # re-do neighborhood for valid r (just to be safe)
+        r_valid = np.where(r>tol0)[0]
+        uidx = uidx[r_valid]
+        
+        dr = dr[r_valid]
+        r = r[r_valid]
+        if do_emb:
+            udens = udens[r_valid]
+        n_neigh = len(uidx)
+        
+        if do_emb:
+            dens = rhos[i]
+            
+        if do_emb:
+            
+            if do_taper_emb:
+                udens_f = taper_fun_emb(udens)
+                dens_f = taper_fun_emb(dens)
+                
+            else:
+                taper_fun_emb = lambda x: 1. if isinstance(x,float) else np.ones(x.shape)
+                udens_f = taper_fun_emb(udens)
+                dens = taper_fun_emb(dens)
+        
+        f = taper_fun(r)
+        N = len(kappa_)
+                
+        if return_force:
+            
+            if do_emb:
+                
+                try:
+                    dens_fp = taper_fun_emb(dens, der=1)
+                    udens_fp = taper_fun_emb(udens, der=1)
+                except TypeError:
+                    dens_fp = misc.derivative(taper_fun_emb, dens, dx=dx, n=1)
+                    udens_fp = misc.derivative(taper_fun_emb, udens, dx=dx, n=1)
+            
+            try:
+                fp = taper_fun(r, der=1)
+            except TypeError:
+                fp = misc.derivative(taper_fun, r, dx=dx, n=1)
+            dr_normed = (dr.T/r)
+        
+        if do_emb: # embedding density version
+            #Nspec = len(species_order)
+            #vals = np.zeros(N*Nspec)
+            #forces = np.zeros((3,N*Nspec))        
+            #idx_dict_species = {k:np.arange(N*v,N*(v+1)) for v,k in enumerate(species_order)}
+            
+            #_forces = np.zeros((3,N))
+            #_vals = np.zeros(N)
+            forces = np.zeros((3,N), dtype=np.float64)
+            vals = np.zeros(N, dtype=np.float64)
+            _forces = np.zeros((3,N), dtype=np.float64)
+            
+            if not spec == emb_spec:
+                # current atom - looping all basis functions
+                for _i in range(N):
+                    
+                    c = kappa_[_i](dens)
+                    vals[_i] = c*dens_f
+
+                    if return_force:
+                        
+                        cp = misc.derivative(kappa_[_i], dens, n=1, dx=dx)
+
+                        _f = (cp*dens_f+c*dens_fp) * fp * dr_normed
+
+                        _forces[:,_i] = _f.sum(axis=1)
+            
+            if return_force:
+               #forces[:,idx_dict_species[spec]] += _forces
+               forces += _forces
+            #vals[idx_dict_species[spec]] += _vals
+            
+            if return_force:
+                
+                # looping all neighbors
+                for i_el, _spec in enumerate(uspecs):
+                    if _spec != emb_spec:
+                        continue
+                    _forces[:,:] = 0.
+                    
+                    _dens = udens[i_el]
+                    _dens_f = udens_f[i_el]
+                    
+                    _dens_fp = udens_fp[i_el]
+                    _fp = fp[i_el]
+                    
+                    # looping all basis functions
+                    for _i in range(N):
+                        
+                        c = kappa_[_i](dens)
+                        cp = misc.derivative(kappa_[_i], dens, n=1, dx=dx)
+                        
+                        _f = (cp*_dens_f+c*_dens_fp) * _fp * dr_normed[:,i_el]
+                        _forces[:,_i] = _f
+                        
+                    #forces[:,idx_dict_species[_spec]] += _forces
+                    forces += _forces
+                    
+        else: # pair distance version
+            
+            vals = np.zeros(N, dtype=np.float64)
+            forces = np.zeros((3,N), dtype=np.float64)        
+            
+            for i in range(N):
+                
+                c = kappa_[i](r)
+                vals[i] = (c*f).sum()
+                
+                if return_force:
+                    
+                    cp = misc.derivative(kappa_[i], r, n=1, dx=dx)
+                    _f = (cp*f + c*fp) * dr_normed
+
+                    forces[:,i] = _f.sum(axis=1)
+        
+        if return_force:
+            return vals, forces
+        else:
+            return vals
+        
+    def fit(self, X, species, uX, uspecies, idx_neigh, y=None):
+        """Compute number of output features.
+
+        Parameters
+        ----------
+        X : array-like, shape (n_atoms, 3)
+            The supercell atom positions.
+        
+        species : np.ndarray of str of shape (n_atoms,)
+            atom species in the supercell
+        
+        uX : array-like, shape (n_ultra_atoms, 3)
+            The ultracell atom positions.
+            
+        uspecies : np.ndarray of str of shape (n_atoms,)
+            atom species in the ultracell
+        
+        idx_neigh : list of np.ndarrays of int
+            indices connecting each atom in X with its neighbors in uX
+            
+        Returns
+        -------
+        self : instance
+        """
+        n_samples, n_features = utils.check_array(X).shape
+        self.n_input_features_ = n_features
+        
+        self.n_output_features_ = self.N
+        #if not self.emb_density_funs is None:
+        #    self.n_output_features_ = self.N*len(self.emb_density_funs)
+        return self
+    
+    def transform(self, X, species, uX, uspecies, uidx_neigh, rhos=None, urhos=None):
+        """Computes the histograms.
+
+        Parameters
+        ----------
+        X : array-like, shape (n_atoms, 3)
+            The supercell atom positions.
+        
+        species : np.ndarray of str of shape (n_atoms,)
+            atom species in the supercell
+        
+        uX : array-like, shape (n_ultra_atoms, 3)
+            The ultracell atom positions.
+            
+        uspecies : np.ndarray of str of shape (n_atoms,)
+            atom species in the ultracell
+        
+        idx_neigh : list of np.ndarrays of int
+            indices connecting each atom in X with its neighbors in uX
+
+        Returns
+        -------
+        XP : np.ndarray of shape (n_samples, n_output_features)
+            The design matrix.
+
+        Note
+        ----
+        Requires prior execution of self.fit.
+        """
+        sklearn.utils.validation.check_is_fitted(self, ['n_input_features_', 'n_output_features_'])
+
+        X = sklearn.utils.validation.check_array(X, dtype=sklearn.utils.validation.FLOAT_DTYPES)
+        n_samples, n_features = X.shape
+
+        if n_features != self.n_input_features_:
+            raise ValueError("X shape does not match training shape")
+
+        # allocate output data
+        XP = np.empty((n_samples, self.n_output_features_), dtype=X.dtype)
+        if self.return_force:
+            XP_f = np.empty((3*n_samples, self.n_output_features_), dtype=X.dtype)
+        
+        for i in range(n_samples):
+            if self.return_force:
+                G, G_f = self._get_Gvalue(i, X, species, uX, uspecies, uidx_neigh,  
+                                     element_filter=self.element_filter, 
+                                     taper_fun=self.taper_fun, kappa_=self.kappa_, 
+                                     return_force=self.return_force, 
+                                     emb_density_funs=self.emb_density_funs, 
+                                     taper_fun_emb=self.taper_fun_emb, rhos=rhos,
+                                     urhos=urhos, tol0=self.tol0, dx=self.dx)
+                XP_f[3*i:3*(i+1),:] = G_f
+            else:
+                G = self._get_Gvalue(i, X, species, uX, uspecies, uidx_neigh,  
+                                     element_filter=self.element_filter, 
+                                     taper_fun=self.taper_fun, kappa_=self.kappa_, 
+                                     return_force=self.return_force,
+                                     emb_density_funs=self.emb_density_funs, 
+                                     taper_fun_emb=self.taper_fun_emb, rhos=rhos,
+                                     urhos=urhos, tol0=self.tol0, dx=self.dx)
             
             XP[i,:] = G
         if self.return_force:
