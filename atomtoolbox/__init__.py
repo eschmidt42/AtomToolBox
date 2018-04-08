@@ -37,7 +37,7 @@ from .eam import get_rhos, get_r_and_dens_values,\
 from .electron_density import rescale_and_shift_densities
 
 from .classification import scipy_gmm_wrapper, GaussianMixtureClassifier,\
-    assign_chemical_disorder_labels, get_decomposed_models
+    assign_chemical_disorder_labels, get_decomposed_models, DNNSoftmaxClassifier
 
 from .crystal import introduce_vacancies, thermal_vacancy_concentration,\
     create_chemical_disorder, insert_spherical_precipitate, get_bicrystal_directions,\

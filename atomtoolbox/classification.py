@@ -6,6 +6,12 @@ from sklearn.mixture import GaussianMixture, BayesianGaussianMixture
 from scipy.cluster import hierarchy
 import matplotlib.pylab as plt
 
+import tensorflow as tf
+import sklearn
+from time import time
+from functools import partial
+from datetime import datetime
+
 def scipy_gmm_wrapper(gmm=None, means_=None, covariances_=None, weights_=None):
     """Wraps the gmm so it's pdf can be accessed.
     """
@@ -593,3 +599,405 @@ def assign_chemical_disorder_labels(atoms_dict, t_l_flat, Phi, mapper, species_f
         if np.isclose(_phi[_ix],1):
             t_l_flat[ix] = sorted_dis_elements[_ix]
     return t_l_flat
+
+def batcher(X, t, n=1):
+    for i in range(1,len(X),n):
+        yield X[i:i+n,:], t[i:i+n]
+
+def tf_softmax_dnn(X_in, t_in=None, mode="fit", path_ckpt="/tmp/dnn-softmax_model.ckpt",
+               learning_rate=.01, l1_scale=0.001, n_epochs=5, batch_size=75, n_print=5,
+               verbose=False, n_hidden1=300, n_hidden2=100, n_hidden3=75, n_hidden4=50,
+               n_hidden5=25, n_outputs=10, **kwargs):
+    
+    tf.reset_default_graph()
+    n_samples, n_inputs = X_in.shape
+    
+    # input and output nodes
+    X = tf.placeholder(tf.float32, shape=(None, n_inputs), name="X")
+    t = tf.placeholder(tf.int64, shape=(None,) , name="t")
+
+    # weights initialization (to prevent vanishing gradient) - Xavier (logistic activation) initialization is the default
+    w_init = tf.contrib.layers.variance_scaling_initializer() # He initialization (ReLU activation)
+
+    # activation
+    activation = tf.nn.relu
+
+    # L1 regularization
+    my_dense_layer = partial(tf.layers.dense, activation=activation, 
+                             kernel_regularizer=tf.contrib.layers.l1_regularizer(l1_scale),
+                             kernel_initializer=w_init)
+
+    # pre-packaged neural layer version
+    with tf.name_scope("dnn"):
+        # no batch normalization
+        hidden1 = tf.layers.dense(X, n_hidden1, name="hidden1", activation=activation,
+                                  kernel_initializer=w_init)
+        hidden2 = tf.layers.dense(hidden1, n_hidden2, name="hidden2", activation=activation,
+                                  kernel_initializer=w_init)
+        hidden3 = tf.layers.dense(hidden2, n_hidden3, name="hidden3", activation=activation,
+                                  kernel_initializer=w_init)
+        hidden4 = tf.layers.dense(hidden3, n_hidden4, name="hidden4", activation=activation,
+                                  kernel_initializer=w_init)
+        hidden5 = tf.layers.dense(hidden4, n_hidden5, name="hidden5", activation=activation,
+                                  kernel_initializer=w_init)
+        logits = tf.layers.dense(hidden4, n_outputs, name="outputs")
+
+    # loss
+    with tf.name_scope("loss"):
+        xentropy = tf.nn.sparse_softmax_cross_entropy_with_logits(labels=t, logits=logits)
+
+        # without regularization
+        loss = tf.reduce_mean(xentropy, name="loss")
+
+    with tf.name_scope("train"):
+        optimizer = tf.train.AdamOptimizer(learning_rate)
+
+        # constant learning rate
+        update = optimizer.minimize(loss)
+
+    with tf.name_scope("eval"):
+        correct = tf.nn.in_top_k(logits, t, 1)
+        accuracy = tf.reduce_mean(tf.cast(correct, tf.float32))
+
+    # logging node
+    now = datetime.utcnow().strftime("%Y%m%d%H%M%S")
+    logdir = "tf_softmax/dnn-%s/" % (now,)
+
+    init = tf.global_variables_initializer()
+
+    saver = tf.train.Saver()
+    
+    if mode == "fit":
+        
+        t0 = time()
+        with tf.Session() as sess:
+
+            init.run()
+
+            for epoch in range(n_epochs):
+                
+                for X_batch, t_batch in batcher(X_in, t_in, n=batch_size):
+                    sess.run(update, feed_dict={X: X_batch, t: t_batch})
+                    
+                acc_train = accuracy.eval(feed_dict={X: X_batch, t:t_batch})
+                if verbose and (epoch%n_print==0 or epoch+1==n_epochs):
+                    print("Epoch", epoch, "Train accuracy", acc_train)
+
+            save_path = saver.save(sess, path_ckpt)
+        if verbose:
+            print("training took %.3f s" % (time()-t0))
+    
+    elif mode == "predict":
+        with tf.Session() as sess:
+            
+            saver.restore(sess, path_ckpt)
+            return logits.eval(feed_dict={X:X_in})
+    else:
+        raise NotImplementedError
+        
+def tf_softmax_dnn_cnn(X_in, t_in=None, mode="fit", path_ckpt="/tmp/dnn-softmax_model.ckpt",
+               learning_rate=.01, l1_scale=0.001, n_epochs=5, batch_size=75, n_print=5,
+               verbose=False, n_hidden=300, n_outputs=10, height=28, width=28, channels=1, **kwargs):
+    
+    tf.reset_default_graph()
+    n_samples, n_inputs = X_in.shape
+    
+    # input and output nodes
+    X = tf.placeholder(tf.float32, shape=(None, n_inputs), name="X")
+    X_reshaped = tf.reshape(X, shape=[-1, height, width, channels])
+    t = tf.placeholder(tf.int64, shape=(None,) , name="t")
+
+    # weights initialization (to prevent vanishing gradient) - Xavier (logistic activation) initialization is the default
+    w_init = tf.contrib.layers.variance_scaling_initializer() # He initialization (ReLU activation)
+
+    # activation
+    activation = tf.nn.relu
+
+    # L1 regularization
+    my_dense_layer = partial(tf.layers.dense, activation=activation, 
+                             kernel_regularizer=tf.contrib.layers.l1_regularizer(l1_scale),
+                             kernel_initializer=w_init)
+
+    with tf.name_scope("cnn"):
+        conv = tf.layers.conv2d(X_reshaped, filters=32, kernel_size=3, strides=[1,1], padding="SAME", name="conv") # strides=[1,2,2,1]
+        conv1 = tf.layers.conv2d(conv, filters=64, kernel_size=3, strides=[2,2], padding="SAME", name="conv1")
+        
+        pool = tf.nn.max_pool(conv1, ksize=[1, 2, 2, 1], strides=[1, 2, 2, 1], padding="VALID")
+        pool_flat = tf.reshape(pool, shape=[-1, pool.get_shape()[1:4].num_elements()])
+        assert np.prod(pool.shape[1:]) == pool_flat.shape[1], "Shape mismatch pool (%s) != pool_flat (%s)" % (pool.shape, pool_flat.shape)
+
+        hidden = tf.layers.dense(pool_flat, n_hidden, activation=tf.nn.relu, name="hidden")
+
+        logits = tf.layers.dense(hidden, n_outputs, name="outputs")
+
+    # loss
+    with tf.name_scope("loss"):
+        xentropy = tf.nn.sparse_softmax_cross_entropy_with_logits(labels=t, logits=logits)
+
+        # without regularization
+        loss = tf.reduce_mean(xentropy, name="loss")
+
+    with tf.name_scope("train"):
+        optimizer = tf.train.AdamOptimizer(learning_rate)
+
+        # constant learning rate
+        update = optimizer.minimize(loss)
+
+    with tf.name_scope("eval"):
+        correct = tf.nn.in_top_k(logits, t, 1)
+        accuracy = tf.reduce_mean(tf.cast(correct, tf.float32))
+
+    # logging node
+    now = datetime.utcnow().strftime("%Y%m%d%H%M%S")
+    logdir = "tf_softmax/dnn-%s/" % (now,)
+
+    init = tf.global_variables_initializer()
+
+    saver = tf.train.Saver()
+    
+    if mode == "fit":
+        
+        t0 = time()
+        with tf.Session() as sess:
+
+            init.run()
+
+            for epoch in range(n_epochs):
+                
+                for X_batch, t_batch in batcher(X_in, t_in, n=batch_size):
+                    sess.run(update, feed_dict={X: X_batch, t: t_batch})
+                    
+                acc_train = accuracy.eval(feed_dict={X: X_batch, t:t_batch})
+                if verbose and (epoch%n_print==0 or epoch+1==n_epochs):
+                    print("Epoch", epoch, "Train accuracy", acc_train)
+
+            save_path = saver.save(sess, path_ckpt)
+        if verbose:
+            print("training took %.3f s" % (time()-t0))
+    
+    elif mode == "predict":
+        with tf.Session() as sess:
+            
+            saver.restore(sess, path_ckpt)
+            return logits.eval(feed_dict={X:X_in})
+    else:
+        raise NotImplementedError
+        
+def tf_softmax_dnn_rnn(X_in, t_in=None, mode="fit", path_ckpt="/tmp/dnn-softmax_model.ckpt",
+               learning_rate=.01, l1_scale=0.001, n_epochs=5, batch_size=75, n_print=5,
+               verbose=False, n_neurons=300, n_outputs=10, n_steps=28, n_inputs=28, **kwargs):
+    
+    tf.reset_default_graph()
+    n_samples, _n_inputs = X_in.shape
+    
+    # input and output nodes
+    assert n_inputs*n_steps == _n_inputs
+    X_in = X_in.reshape((-1, n_steps, n_inputs))
+    X = tf.placeholder(tf.float32, shape=(None, n_steps, n_inputs), name="X")
+    #X_reshaped = tf.reshape(X, shape=[-1, n_steps, n_inputs,])
+    #X = tf.placeholder(tf.float32, [None, n_steps, n_inputs], name="X")
+    t = tf.placeholder(tf.int64, shape=(None,) , name="t")    
+    
+    with tf.name_scope("rnn"):
+        basic_cell = tf.contrib.rnn.BasicRNNCell(num_units=n_neurons)
+        outputs, states = tf.nn.dynamic_rnn(basic_cell, X, dtype=tf.float32)
+
+        logits = tf.layers.dense(states, n_outputs, name="outputs")
+
+    # loss
+    with tf.name_scope("loss"):
+        xentropy = tf.nn.sparse_softmax_cross_entropy_with_logits(labels=t, logits=logits)
+
+        # without regularization
+        loss = tf.reduce_mean(xentropy, name="loss")
+
+    with tf.name_scope("train"):
+        optimizer = tf.train.AdamOptimizer(learning_rate)
+
+        # constant learning rate
+        update = optimizer.minimize(loss)
+
+    with tf.name_scope("eval"):
+        correct = tf.nn.in_top_k(logits, t, 1)
+        accuracy = tf.reduce_mean(tf.cast(correct, tf.float32))
+
+    # logging node
+    now = datetime.utcnow().strftime("%Y%m%d%H%M%S")
+    logdir = "tf_softmax/dnn-%s/" % (now,)
+
+    init = tf.global_variables_initializer()
+
+    saver = tf.train.Saver()
+    
+    if mode == "fit":
+        
+        t0 = time()
+        with tf.Session() as sess:
+
+            init.run()
+
+            for epoch in range(n_epochs):
+                
+                for X_batch, t_batch in batcher(X_in, t_in, n=batch_size):
+                    sess.run(update, feed_dict={X: X_batch, t: t_batch})
+                    
+                acc_train = accuracy.eval(feed_dict={X: X_batch, t:t_batch})
+                if verbose and (epoch%n_print==0 or epoch+1==n_epochs):
+                    print("Epoch", epoch, "Train accuracy", acc_train)
+
+            save_path = saver.save(sess, path_ckpt)
+        if verbose:
+            print("training took %.3f s" % (time()-t0))
+    
+    elif mode == "predict":
+        with tf.Session() as sess:
+            
+            saver.restore(sess, path_ckpt)
+            return logits.eval(feed_dict={X:X_in})
+    else:
+        raise NotImplementedError
+            
+class DNNSoftmaxClassifier(sklearn.base.BaseEstimator, sklearn.base.ClassifierMixin):
+
+    dnn_params = dict(n_hidden1 = 300, 
+                      n_hidden2 = 100, 
+                      n_hidden3 = 75, 
+                      n_hidden4 = 50, 
+                      n_hidden5 = 25, 
+                      learning_rate = .01,
+                      path_ckpt = "/tmp/dnn-softmax_model.ckpt",
+                      l1_scale = 0.001, 
+                      n_epochs = 5, 
+                      batch_size = 75, 
+                      n_print = 5,
+                      verbose = False,)
+    
+    dnn_type = "simple"
+    
+    dnn_impl = {"simple":tf_softmax_dnn,
+                "cnn":tf_softmax_dnn_cnn,
+                "rnn":tf_softmax_dnn_rnn}
+    
+    def __init__(self, dnn_type=None, dnn_params=None):
+
+        if  (not dnn_type is None) and (dnn_type in self.dnn_impl):
+            self.dnn_type = dnn_type
+        
+        if (not dnn_params is None) and isinstance(dnn_params,dict):
+            self.dnn_params = dnn_params
+
+    def fit(self, X, y, sample_weight=None):
+        """Fit the model according to the given training data.
+
+        Parameters
+        ----------
+        X : {array-like, sparse matrix}, shape (n_samples, n_features)
+            Training vector, where n_samples is the number of samples and
+            n_features is the number of features.
+
+        y : array-like, shape (n_samples,)
+            Target vector relative to X.
+
+        sample_weight : array-like, shape (n_samples,) optional
+            Array of weights that are assigned to individual samples.
+            If not provided, then each sample is given unit weight.
+
+            .. versionadded:: 0.17
+               *sample_weight* support to LogisticRegression.
+
+        Returns
+        -------
+        self : object
+            Returns self.
+        """
+                
+        X, y = sklearn.utils.validation.check_X_y(X, y, accept_sparse='csr', dtype=np.float64,
+                         order="C")
+        
+        sklearn.utils.multiclass.check_classification_targets(y)
+        self.classes_ = np.unique(y)
+        
+        n_samples, n_features = X.shape
+
+        n_classes = len(self.classes_)
+        classes_ = self.classes_
+        self.dnn_params["n_outputs"] = n_classes
+        if n_classes < 2:
+            raise ValueError("This solver needs samples of at least 2 classes"
+                             " in the data, but the data contains only one"
+                             " class: %r" % classes_[0])
+
+        if len(self.classes_) == 2:
+            n_classes = 1
+            classes_ = classes_[1:]
+
+        self.dnn_impl[self.dnn_type](X, t_in=y, mode="fit", **self.dnn_params)
+
+        return self
+    
+    def decision_function(self, X):
+        return self.dnn_impl[self.dnn_type](X, mode="predict", **self.dnn_params)
+
+    def predict_proba(self, X):
+        """Probability estimates.
+
+        The returned estimates for all classes are ordered by the
+        label of classes.
+
+        For a multi_class problem, if multi_class is set to be "multinomial"
+        the softmax function is used to find the predicted probability of
+        each class.
+        Else use a one-vs-rest approach, i.e calculate the probability
+        of each class assuming it to be positive using the logistic function.
+        and normalize these values across all the classes.
+
+        Parameters
+        ----------
+        X : array-like, shape = [n_samples, n_features]
+
+        Returns
+        -------
+        T : array-like, shape = [n_samples, n_classes]
+            Returns the probability of the sample for each class in the model,
+            where classes are ordered as they are in ``self.classes_``.
+        """
+        
+        return sklearn.utils.extmath.softmax(self.decision_function(X), copy=False)
+
+    def predict_log_proba(self, X):
+        """Log of probability estimates.
+
+        The returned estimates for all classes are ordered by the
+        label of classes.
+
+        Parameters
+        ----------
+        X : array-like, shape = [n_samples, n_features]
+
+        Returns
+        -------
+        T : array-like, shape = [n_samples, n_classes]
+            Returns the log-probability of the sample for each class in the
+            model, where classes are ordered as they are in ``self.classes_``.
+        """
+        return np.log(self.predict_proba(X))
+    
+    def predict(self, X):
+        """Predict class labels for samples in X.
+
+        Parameters
+        ----------
+        X : {array-like, sparse matrix}, shape = [n_samples, n_features]
+            Samples.
+
+        Returns
+        -------
+        C : array, shape = [n_samples]
+            Predicted class label per sample.
+        """
+        scores = self.decision_function(X)
+        if len(scores.shape) == 1:
+            indices = (scores > 0).astype(np.int)
+        else:
+            indices = scores.argmax(axis=1)
+        return self.classes_[indices]
