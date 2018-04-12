@@ -15,7 +15,8 @@ from .misc import show_atoms, print_error_distributions_properties,\
     cell2box, box2cell, wrap_lammps_pos, lammps2ase,\
     lammpstrj_to_design_matrices, periodic_distances, \
     fclusterdata, get_GB_position_DataFrame, get_GB_positions_from_histograms,\
-    square_cluster_statistics
+    square_cluster_statistics, plot_single_feature_distribution,\
+    get_stratified, precision_barplot_classifier_cloudtype
 
 
 from .features import make_array, get_crystal_design_matrix, get_angles, get_q, get_q2, get_q3,\

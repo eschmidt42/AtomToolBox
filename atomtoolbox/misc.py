@@ -1000,3 +1000,94 @@ def square_cluster_statistics(all_cluster_statistics, min_size=1, Natoms=None):
             atom_distributions[i,0] = Natoms - atom_distributions[i,1:].sum()
             
     return cluster_size, cluster_distributions, atom_distributions
+
+def plot_single_feature_distribution(Phi_df,feature="feature0"):
+
+    import seaborn as sns
+    sns.set(style="white", rc={"axes.facecolor": (0, 0, 0, 0)})
+
+    pal = sns.cubehelix_palette(10, rot=-.25, light=.7)
+    g = sns.FacetGrid(Phi_df, row="cloudtype", hue="cloudtype", aspect=15, size=.5, palette=pal)
+    
+    bw = .01
+    g.map(sns.kdeplot, feature, shade=True, alpha=1, lw=1.5, bw=bw, clip_on=False)
+    g.map(sns.kdeplot, feature, color="w", lw=2, bw=bw, clip_on=False)
+    g.map(plt.axhline, y=0, lw=2, clip_on=False)
+
+    def fun_label(x, color, label):
+        ax = plt.gca()
+        ax.text(0, .4, label, fontweight="bold", color=color, 
+                ha="left", va="center", transform=ax.transAxes)
+    g.map(fun_label, feature)
+
+    g.fig.subplots_adjust(hspace=-.1)
+    g.set_titles("")
+    g.set(yticks=[])
+    g.despine(bottom=True, left=True)
+
+    plt.show()
+
+def get_stratified(y, Ndraws, flat=True):
+    """Returns indices for stratified samples.
+    
+    Parameters
+    ----------
+    y : np.ndarray of str or int and shape (Nsamples,)
+        Labels to sample.
+    Ndraws : int
+        Number of samples to draw for each label
+    flat : boolean, optional, default True
+        Whether or not to flatten the returned indices.
+        
+    Returns
+    -------
+    idx_stratified : np.ndarray of int and shape (len(np.unique(y)),Ndraws) or (len(np.unique(y)),)
+    """
+    
+    labels = np.unique(y)
+    labels.sort()
+    idx_stratified = np.array([np.random.choice(np.where(y==label)[0], size=Ndraws, replace=False)\
+                               for label in labels])
+    if flat:
+        return idx_stratified.ravel()
+    return idx_stratified
+
+def precision_barplot_classifier_cloudtype(all_trained_classifiers,
+                                           Phi_by_cloud, int2str_map, Ndraws=None, all_Ndraws=None):
+    import seaborn as sns
+    
+    if Ndraws is None:
+        idx_draws = -1
+    elif isinstance(Ndraws,int) and not (all_Ndraws is None):
+        idx_draws = all_Ndraws.index(Ndraws)
+    else:
+        raise NotImplementedError
+    
+    data = {}
+    _Phis = {_l: np.vstack(Phi_by_cloud[_l]) for _l in Phi_by_cloud}
+    for classifier in sorted(all_trained_classifiers):
+        data[classifier] = {}
+        for label in sorted(Phi_by_cloud):
+        
+            _Phi = _Phis[label]
+            pred_new = all_trained_classifiers[classifier][idx_draws].predict(_Phi)
+            counts = collections.Counter(pred_new)
+            
+            try:
+                data[classifier][label] = counts[label]/_Phi.shape[0]*100.
+            except KeyError:
+                data[classifier][label] = 0.
+    
+    sns.set(style="white", context="talk")
+    f, axs = plt.subplots(len(data), 1, figsize=(10,2*len(data)), sharex=True)
+    if not isinstance(axs, (list, np.ndarray)):
+        axs = [axs]
+    
+    x = sorted(Phi_by_cloud.keys())
+    x_str = [int2str_map[v] for v in x]
+    for i,classifier in enumerate(sorted(data)):
+        sns.barplot(x_str, [data[classifier][_k] for _k in x], ax=axs[i])
+        axs[i].set_ylabel(classifier)
+    sns.despine(bottom=True)
+    plt.tight_layout()
+    plt.show()
