@@ -3,8 +3,11 @@ import copy, os, pickle, collections, warnings
 from scipy import stats, optimize
 import numpy as np
 from sklearn.mixture import GaussianMixture, BayesianGaussianMixture
+from sklearn.cluster import KMeans
 from scipy.cluster import hierarchy
+from scipy import spatial
 import matplotlib.pylab as plt
+import matplotlib as mpl
 
 import tensorflow as tf
 import sklearn
@@ -45,6 +48,25 @@ def scipy_gmm_wrapper(gmm=None, means_=None, covariances_=None, weights_=None):
     return scipy_gmm
 
 def get_decomposed_models(in_models, verbose=False):
+    """Decomposes 'models'.
+
+    Parameters
+    ----------
+    in_models : dict of lists
+        Example: {"a":[0,2], "b":[0,1]}
+    verbose : boolean, optional, default False
+    
+    Returns
+    -------
+    out_models : list of np.ndarrays of int
+        Each np.ndarray represents a maximally decomposed model
+        breaking down in_models.
+    
+    Example:
+    >>> in_model = {"a":[0,2], "b":[0,1]}
+    >>> print(get_decomposed_models(in_model))
+    [array([2]), array([1]), array([0])]
+    """
     if verbose:
         print("in_models ",in_models)
     out_models = []
@@ -150,7 +172,7 @@ class GaussianMixtureClassifier:
     regression of the given samples. In this class the training set is 
     split by class and approximates the entire density distributions for 
     each class. The resulting pdfs are then used for classification.
-    This class can also do decomposition auf Gaussian Mixture Models (GMMs).
+    This class can also do decomposition of Gaussian Mixture Models (GMMs).
     
     The decomposition is triggered when GaussianMixtureClassifier.fit
     is passed an X that is a list of np.ndarrays. It is then assumed that each
@@ -206,14 +228,17 @@ class GaussianMixtureClassifier:
     labels = None
     idx_class = None
     
-    weights_ = dict()
-    covariances_ = dict()
-    means_ = dict()
+    weights_ = dict() # keys are integers. correspond to order of 'appearances' (a list)
+    covariances_ = dict() # keys are integers. correspond to order of 'appearances' (a list)
+    means_ = dict() # keys are integers. correspond to order of 'appearances' (a list)
     label_map = None
     check_labels = True
+    appearances = None # in which original given crystals centroids were observed
     
-    def __init__(self, gmm=None, load_path=None, tol0=1e-6, cluster = {"method":"average","metric":"euclidean",
-                       "threshold":1e-6,"criterion":"distance","cluster_parameters":"mu","combine":"mean"},
+    default_cluster_kwargs = {"method":"average","metric":"euclidean","cluster_parameters":"mu",
+                            "threshold":1e-6,"criterion":"distance","combine":"mean"}
+    
+    def __init__(self, gmm=None, load_path=None, tol0=1e-6, cluster = default_cluster_kwargs,
                  weights_fit_method="Nelder-Mead", verbose=False, check_labels=False):
         if not gmm is None:
             assert isinstance(gmm,(GaussianMixture, BayesianGaussianMixture)), "'gmm' needs to be an instance of sklearn.mixture.{GaussianMixture, BayesianGaussianMixture}!"
@@ -230,6 +255,9 @@ class GaussianMixtureClassifier:
             
         # decomposition related parameters
         self.tol0 = tol0
+        for _k, _v in self.default_cluster_kwargs.items():
+            if not _k in cluster:
+                cluster[_k] = _v
         self.cluster = cluster
         self.weights_fit_method = weights_fit_method
         
@@ -249,6 +277,8 @@ class GaussianMixtureClassifier:
         self.covariances_ = params["covariances_"]
         self.means_ = params["means_"]
         self.label_map = params["label_map"]
+        if "appearances" in params:
+            self.appearances = params["appearances"]
         if self.check_labels:
             assert not self.label_map is None, "No labels are given in the stored file!"
             assert len(self.fitted_gmms) == len(self.label_map), "The number of GMMs (%i) does not match the number of available labels (%i)!" % (len(self.fitted_gmms),len(self.label_map))
@@ -257,7 +287,8 @@ class GaussianMixtureClassifier:
         params = {"weights_":self.weights_,
                   "covariances_":self.covariances_,
                   "means_":self.means_,
-                  "label_map":self.label_map}
+                  "label_map":self.label_map,
+                  "appearances":self.appearances}
         with open(save_path,"wb") as f:
             pickle.dump(params,f)
     
@@ -311,11 +342,13 @@ class GaussianMixtureClassifier:
             all_gmms = [copy.deepcopy(self.gmm).fit(X[i]) for i in range(Nstructures)]
             
             # compressed and decomposed (cd) model            
-            mus_cd, covs_cd = self.decompose_gmms(all_gmms, structure_ids, n_features,
+            mus_cd, covs_cd, appearances = self.decompose_gmms(all_gmms, structure_ids, n_features,
                                                   method=self.cluster["method"], metric=self.cluster["metric"], 
                                                   threshold=self.cluster["threshold"], criterion=self.cluster["criterion"],
-                                                  cluster_parameters=self.cluster["cluster_parameters"], combine=self.cluster["combine"],)
+                                                  cluster_parameters=self.cluster["cluster_parameters"], combine=self.cluster["combine"],
+                                                  verbose=self.verbose)
             N_cd = len(mus_cd)
+            self.appearances = appearances.copy()
                         
             # re-fit models
             gmms_cd = []
@@ -471,7 +504,7 @@ class GaussianMixtureClassifier:
                 print("    compressed ",compressed_model_reference[sid])
             
         # decompose by comparison
-        compressed_decomposed_models = get_decomposed_models(compressed_model_reference, verbose=False)
+        compressed_decomposed_models = get_decomposed_models(compressed_model_reference, verbose=verbose)
         
         if verbose:
             print("compressed_decomposed_models ",compressed_decomposed_models)
@@ -481,7 +514,22 @@ class GaussianMixtureClassifier:
         # compressed and decomposed (cd) parameters
         mus_cd = [all_mus_clustered[m,:] for m in compressed_decomposed_models]
         covs_cd = [all_covs_clustered[m,:] for m in compressed_decomposed_models]
-        return mus_cd, covs_cd
+        
+        # model origins
+        if verbose:
+            print("\nMaximally decomposed models:")
+            print("Components -> component appearances")
+
+        appearances = []
+
+        for _decomposed_model in compressed_decomposed_models:
+            _appearances = [_label for _label,_vals in compressed_model_reference.items()\
+                           if any([_val in _decomposed_model for _val in _vals])]
+            if verbose:
+                print("%s -> %s"%(str(_decomposed_model), ", ".join(sorted(_appearances))))
+            appearances.append(_appearances)
+            
+        return mus_cd, covs_cd, appearances
     
     def predict_proba(self, X):
         p = np.zeros((X.shape[0],len(self.fitted_gmms)))
@@ -494,7 +542,7 @@ class GaussianMixtureClassifier:
     
     def show(self, X, y, axes=[0,1], title=None, xlim=(0,1), ylim=(0,1),
              xlabel=None, ylabel=None, labelfs=16, tickfs=14, legendfs=12,
-             titlefs=18, data_labels=None):
+             titlefs=18, data_labels=None, cmap=plt.cm.jet, figsize=(10,5)):
         """Plots."""
         isarray = isinstance(X,np.ndarray)
         islist = isinstance(X,list) and all([isinstance(x,np.ndarray) for x in X])
@@ -505,13 +553,19 @@ class GaussianMixtureClassifier:
 
         uy = np.unique(y) if isarray else np.unique(np.hstack(y))
         _y = np.copy(y) if isarray else np.hstack(y)
+        
+        norm = mpl.colors.Normalize(vmin=uy.min(), vmax=uy.max())
 
-        fig = plt.figure()
+        fig = plt.figure(figsize=figsize)
         ax = fig.add_subplot(121) if islist else fig.add_subplot(111)
         ax.set_aspect("equal")
+        hs = [None for _uy in uy]
         for i,_uy in enumerate(uy):
             idx = np.where(_y==_uy)[0]
-            ax.plot(_X[idx,axes[0]],_X[idx,axes[1]],'o',label="class "+str(_uy),markerfacecolor="None",alpha=.5)
+            ax.scatter(_X[idx,axes[0]], _X[idx,axes[1]], label="class %i"%_uy, 
+                       alpha=.5, color=cmap(norm(_uy*np.ones(len(idx)))))
+            ax.scatter(self.means_[i][:,axes[0]], self.means_[i][:,axes[1]],
+                       marker="+", color=cmap(norm(_uy*np.ones(len(self.means_[i])))))
         if xlabel is None:
             ax.set_xlabel("Feature {}".format(axes[0]), fontsize=labelfs)
         else:
@@ -524,17 +578,20 @@ class GaussianMixtureClassifier:
         ax.set_ylim(ylim)
         ax.set_title("Inferred classes",fontsize=labelfs)
         ax.tick_params(labelsize=tickfs)
-        plt.legend(loc=0,fontsize=legendfs)
+        ax.legend(loc=0, fontsize=legendfs)
 
         if islist:
             ax2 = fig.add_subplot(122)
             ax2.set_aspect("equal")
+            norm = mpl.colors.Normalize(vmin=0, vmax=len(X))
+            hs = [None for _X in X]
             for i,_X in enumerate(X):
                 if data_labels is None:
-                    label = "crystal#"+str(i)
+                    label = "trajectory #%i"%i
                 else:
                     label = data_labels[i]
-                ax2.plot(_X[:,axes[0]],_X[:,axes[1]],'o',label=label,markerfacecolor="None",alpha=.5)
+                ax2.scatter(_X[:,axes[0]], _X[:,axes[1]], label=label, c=cmap(norm(np.ones(_X.shape[0])*i)),
+                            alpha=.5)
             if xlabel is None:
                 ax2.set_xlabel("Feature {}".format(axes[0]), fontsize=labelfs)
             else:
@@ -546,9 +603,10 @@ class GaussianMixtureClassifier:
             ax2.tick_params(labelsize=tickfs)
             ax2.set_xlim(xlim)
             ax2.set_ylim(ylim)
-            ax2.set_title("Crystals")
-            plt.legend(loc=0, fontsize=legendfs)
-        plt.suptitle(title, fontsize=titlefs)
+            ax2.set_title("Trajectories", fontsize=labelfs)
+            ax2.legend(loc=0, fontsize=legendfs)
+        if not title is None:
+            plt.suptitle(title, fontsize=titlefs)
         plt.tight_layout()
         plt.show()
                 
@@ -575,6 +633,538 @@ class GaussianMixtureClassifier:
     
     def pdf(self, X, label):
         return self.fitted_gmms[label](X)
+    
+    def explain_inference(self, abbreviate=True):
+        assert not any([self.appearances is None, len(self.means_)==0]), "Class instance does not appear to have self.appearances and or self.centroids_ set."
+        
+        print("\nMaximally decomposed models:")
+        print("Components -> component appearances") 
+        for i, _appearances in enumerate(self.appearances):
+            _decomposed_model = self.means_[i].shape if abbreviate else self.means_[i]
+            print("%s -> %s"%(", ".join(sorted(_appearances)),_decomposed_model))
+            
+    def set_labels(self,labels):
+        """Sets labels for the label_map.
+        
+        Associates model identifier (integer value of self.centroids_)
+        with a string, e.g. name for a type of crystal.
+        
+        Parameters
+        ----------
+        labels : dict
+            Example: {"fcc":0, "fccVac":[1,2]}
+            
+        Note: 'labels' can also just set strings for a subset of model identifiers
+        since not always all names which should be assigned are immediately obvious.
+        The remaining labels are set to string versions of integer values.
+        """
+        assert isinstance(labels,dict)
+        assert all([isinstance(_k,str) for _k in labels.keys()])
+        assert all([isinstance(_v,(int,list,tuple)) for _v in labels.values()])
+        
+        if self.label_map is None:
+            self.label_map = dict()
+        
+        values = set()    
+        for _k, _v in labels.items():
+            self.label_map[_k] = _v
+            if isinstance(_v,int):
+                values.add(_v)
+            else:
+                for _v2 in _v:
+                    values.add(_v2)
+            
+        for _k in set(self.means_.keys()).difference(values):
+            self.label_map[str(_k)] = _k
+
+def kmeans_wrapper(kmeans=None, centroids_=None):
+    """Wraps the kmeans so it can be accessed.
+    """
+    kmeans_given = (not kmeans is None)
+    parameters_given = not (centroids_ is None)
+    assert kmeans_given or parameters_given,\
+        "Either 'kmeans' needs to be given or 'centroids_'!"
+    
+    if kmeans_given:
+        centroids_ = kmeans.cluster_centers_.copy()
+    elif parameters_given:
+        pass
+    else:
+        raise ValueError("WTF!")
+    
+    def _kmeans(x):
+        
+        Phi = spatial.distance.cdist(x, centroids_)
+        assert Phi.shape == (x.shape[0], centroids_.shape[0])
+        
+        return Phi.min(axis=1)
+
+    return _kmeans
+
+class KMeansClassifier:
+    """Approximates the sample distribution for classification.
+    
+    KMeans as implemented in sklearn classifies by individual centroids found during the  
+    regression of the given samples. In this class the training set is 
+    split by class and approximates the sample distributions for 
+    each class. The resulting groups of centroids are then used for classification.
+    This class can also do decomposition of KMeans models.
+    
+    The decomposition is triggered when KMeansClasifier.fit
+    is passed an X that is a list of np.ndarrays. It is then assumed that each
+    array contains a superposition of underlying distributions, e.g. comparison of 
+    LAMMPS trajectories of different crystals.
+    
+    Parameters
+    ----------
+
+    kmeans : instance of Kmeans, optional, default None
+        Required to regress data.
+        
+    load_path : str, optional default None
+        To load results of a previous regression.
+
+    check_labels : boolean, optional, default True
+        Checks upon loading the classifier from disk whether the number of 
+        Kmeans models matches the number of known labels or not.
+
+    Methods
+    -------
+
+    fit : fit(X, y)
+        Approximates the density distributions using the provided centroids.
+        X : float np.ndarray of shape (N, M)
+        y : int np.ndarray of shape (N,)
+    
+        
+    predict : predict(X, show=False, axes=[0,1])
+        Requires previous execution of 'fit'. Returns most probably class
+        for all samples. Optionally can also plot the classification along
+        two axes.
+
+    pdf : pdf(X, label)
+        Requires previous execution of 'fit'. Allows access to the 
+        pdf for a specified class.
+        label : int
+        
+    cluster : dict
+        Settings for the clustering/decomposition of centroids. See self.decompos_kmeans 
+        for more detail.
+    
+    Example
+    -------
+    >>> kmc = atb.KMeansClassifier(KMeans(n_clusters=4), cluster={"threshold":.5})
+    >>> _D = 2
+    >>> _X = [np.vstack((stats.norm.rvs(size=(220,_D), loc=1, scale=1), stats.norm.rvs(size=(200,_D), loc=0, scale=1.))),
+        stats.norm.rvs(size=(400,_D), loc=3, scale=1.),stats.norm.rvs(size=(200,_D), loc=3, scale=1.)]
+    >>> kmc.fit(_X)
+    >>> kmc.explain_inference()
+    Maximally decomposed models:
+    Components -> component appearances
+    structure2 -> [[4.1626868  3.06136932]
+    [2.16839552 2.92352057]
+    [2.98831573 4.29232913]
+    [2.92131459 1.68174912]]
+    structure1 -> [[3.61949901 4.03556476]
+    [2.38409816 2.06630056]
+    [4.01029769 2.31575259]
+    [2.15251654 3.65100976]]
+    structure0 -> [[-0.32768532  0.96976257]
+    [ 1.39818763  0.33646176]
+    [-0.3366716  -0.75370139]
+    [ 1.2962009   2.09468514]]
+    """
+    
+    fitted_kmeans = dict()
+    labels = None
+    idx_class = None
+    
+    centroids_ = dict() # keys are integers. correspond to order of 'appearances' (a list)
+    label_map = None # needs to be assigned manually after understanding the meaning of the centroids relative to the given structures
+    check_labels = True
+    appearances = None # in which original given crystals centroids were observed
+    
+    default_cluster_kwargs = {"method":"average","metric":"euclidean",
+                            "threshold":1e-6,"criterion":"distance","combine":"mean"}
+    
+    def __init__(self, kmeans=None, load_path=None, tol0=1e-6, 
+                 cluster = default_cluster_kwargs,
+                 verbose=False, check_labels=False):
+        if not kmeans is None:
+            assert isinstance(kmeans,KMeans), "'kmeans' needs to be an instance of sklearn.cluster.KMeans!"
+        elif isinstance(load_path,str):
+            assert os.path.exists(load_path), "Given 'load_path' ({}) invalid!".format(load_path)
+        else:
+            raise ValueError("Either 'kmeans' or 'load_path' needs to be given!")
+            
+        self.kmeans = kmeans
+        self.check_labels = check_labels
+                
+        if kmeans is None:
+            self._load_parameters(load_path)
+            
+        # decomposition related parameters
+        self.tol0 = tol0
+        for _k, _v in self.default_cluster_kwargs.items():
+            if not _k in cluster:
+                cluster[_k] = _v
+        self.cluster = cluster
+                
+        # misc
+        self.verbose = verbose
+    
+    def _load_parameters(self,load_path):
+        with open(load_path,"rb") as f:
+            params = pickle.load(f)
+        
+        for label in sorted(params["centroids_"]):
+            self.fitted_kmeans[label] = kmeans_wrapper(centroids_=params["centroids_"][label])
+        
+        self.centroids_ = params["centroids_"]
+        self.label_map = params["label_map"]
+        if "appearances" in params:
+            self.appearances = params["appearances"]
+        if self.check_labels:
+            assert not self.label_map is None, "No labels are given in the stored file!"
+            assert len(self.fitted_kmeans) == len(self.label_map), "The number of KMeans models (%i) does not match the number of available labels (%i)!" % (len(self.fitted_gmms),len(self.label_map))
+            
+    def save(self,save_path):
+        params = {"centroids_":self.centroids_,
+                  "label_map":self.label_map,
+                  "appearances":self.appearances}
+        with open(save_path,"wb") as f:
+            pickle.dump(params,f)
+    
+    def fit(self, X, y=None, label_map=None):
+        """Fits.
+        
+        Parameters
+        ----------
+        X : np.ndarray of floats or list of np.ndarrays
+        
+        Notes
+        -----
+        If X is an array then y needs to be given and the classifier is developed
+        directly over all the samples. If, otherwise, X is a list of arrays then
+        y is not needed and labels are generated by decomposing the arrays in X by 
+        comparison of their computed pdfs.
+        """
+        X_is_array = isinstance(X,np.ndarray)
+        X_is_list = isinstance(X,list)
+        if X_is_array:
+            assert isinstance(y,np.ndarray), "'X' is an array and thus 'y' needs to be an array!"
+            assert y.shape[0]==X.shape[0], "The array 'X' of shape {} is not matched by 'y' of shape {}!".format(X.shape,y.shape)
+        elif X_is_list:
+            assert all([isinstance(x,np.ndarray) for x in X]), "'X' is a list and all its entries need to be np.ndarrays! Got: {}".format([type(x) for x in X])
+            assert len(set([x.shape[1] for x in X]))==1, "All arrays in 'X' need to have the same number of features! Got: {}".format([x.shape[1] for x in X])
+            n_features = X[0].shape[1]
+        else:
+            raise ValueError("'X' input not understood. Needs to be an array of list of arrays!")
+        
+        if X_is_array:
+            self.label_map=label_map
+            self.labels = np.unique(y)
+            self.idx_class = {k: np.where(y==k)[0] for k in self.labels}
+            for label in sorted(self.idx_class):
+
+                _km = copy.deepcopy(self.kmeans)
+                _km.fit(X[self.idx_class[label],:])
+
+                self.fitted_kmeans[label] = kmeans_wrapper(kmeans=_km)   
+
+                self.centroids_[label] = _km.cluster_centers_
+        
+        elif X_is_list:
+            
+            Nstructures = len(X)
+            structure_ids = ["structure%s"%i for i in range(Nstructures)]
+            
+            # fit structure pdfs
+            all_kmeans = [copy.deepcopy(self.kmeans).fit(X[i]) for i in range(Nstructures)]
+            
+            # compressed and decomposed (cd) model            
+            centroids_cd, appearances = self.decompose_kmeans(all_kmeans, structure_ids, n_features,
+                                                  method=self.cluster["method"], metric=self.cluster["metric"], 
+                                                  threshold=self.cluster["threshold"], criterion=self.cluster["criterion"],
+                                                  combine=self.cluster["combine"],
+                                                  verbose=self.verbose)
+            N_cd = len(centroids_cd)
+            self.appearances = appearances.copy()
+                        
+            # re-fit models
+            kmeans_cd = []
+            _X = np.vstack(X)
+            
+            if self.verbose:
+                print("number of resulting models: ",N_cd)
+                print("number of components in total: ",sum(c.shape[0] for c in centroids_cd))
+            
+            for i in range(N_cd):
+                self.fitted_kmeans[i] = kmeans_wrapper(centroids_=centroids_cd[i])
+                self.centroids_[i] = centroids_cd[i]
+                            
+        else:
+            raise ValueError("Boink!")
+            
+    @staticmethod
+    def decompose_kmeans(kmeans, structure_ids, n_features, method="average",
+                       metric="euclidean", threshold=1e-6, criterion="distance",
+                       combine="mean", verbose=False):
+        """Decomposes K-Means models.
+
+        Parameters
+        ----------
+        kmeans : list of KMeans instances
+
+        structure_ids : list of str
+            Names for the individual structures.
+
+        n_features : int
+            Number of features.
+
+        method : str, optional, default "average"
+            Method to use in scipy.cluster.hierarchy.linkage
+
+        metric: str, optional, default, "euclidean"
+            Metric to use in scipy.cluster.hierarchy.linkage.
+
+        threshold : float, optional, default 1e-6
+            Threshold to use in scipy.cluster.hierarchy.fcluster. The
+            smaller the value the more clusters will be found.
+
+        criterion : str, optional, default "distance"
+            Criterion to use in scipy.cluster.hierarchy.fcluster.
+
+        combine : str, optional, default "mean"
+            Specifies how Gaussians found to belong to the same cluster are to be 
+            combined. Currently "mean" is the only recognized option.
+            
+        Returns
+        -------
+        mus_cd : list of np.ndarrays of int
+            Each np.ndarray represents the collection of clusters
+            for a maximally decomposed set of centroids.
+        appearances : list of lists of str
+            Same order as mus_cd, indicating the origin of the collection
+            of clusters.
+            
+        Example: Assume mus_cd = [np.array([0,1]), np.array([2])] and
+        appearances = [["structure0"], ["structure1", "structure2"]]. 
+        This means that structure1 and structure2 shared the same centroid 
+        number 2 and structure0 was the only one for which centroids number
+        0 and 1 were found. For crystals that could mean that structure1 and 
+        structure2 were really two files containing the same type of crystal.
+        """
+
+        model_reference = {}
+        N = 0
+        all_covs = []
+        all_mus = []
+
+        for i, sid in enumerate(structure_ids):
+            model_reference[sid] = np.arange(N,N+kmeans[i].cluster_centers_.shape[0])
+
+            N += kmeans[i].cluster_centers_.shape[0]
+            mus = np.array([m for m in kmeans[i].cluster_centers_])
+
+            all_mus.append(mus)
+
+        all_mus = np.vstack(all_mus)
+
+        # find approximately unique components
+        p = all_mus
+
+        Z = hierarchy.linkage(p, method=method, metric=metric)
+        T = hierarchy.fcluster(Z, threshold, criterion=criterion) -1
+
+        # relabel clusters to keep original parameter ordering
+        T_map, _c = {}, 0
+        for _t in T:
+            if not _t in T_map:
+                T_map[_t] = _c
+                _c += 1
+
+        T = np.array([T_map[_t] for _t in T])
+        T_set = np.sort(np.unique(T))
+
+        # combine parameters and thus compress models
+        all_mus_clustered = []
+
+        for t in T_set:
+            if combine == "mean":
+                _mu = all_mus[T==t,:].mean(axis=0)
+            else:
+                raise ValueError("'combine' ({}) not understood!".format(combine))
+            all_mus_clustered.append(_mu)
+
+        all_mus_clustered = np.array(all_mus_clustered)
+
+        compressed_model_reference = {sid:np.sort(np.unique(T[vals])) for sid, vals in model_reference.items()}
+        if verbose:
+            print("model_reference:")
+            for sid in sorted(model_reference):
+                print("    initial ",model_reference[sid])
+                print("    compressed ",compressed_model_reference[sid])
+
+        # decompose by comparison
+        compressed_decomposed_models = get_decomposed_models(compressed_model_reference, verbose=verbose)
+
+        if verbose:
+            print("compressed_decomposed_models ",compressed_decomposed_models)
+            print("all_mus_clustered ",all_mus_clustered.shape)
+
+        # compressed and decomposed (cd) parameters
+        mus_cd = [all_mus_clustered[m,:] for m in compressed_decomposed_models]
+
+        # model origins
+        if verbose:
+            print("\nMaximally decomposed models:")
+            print("Components -> component appearances")
+
+        appearances = []
+
+        for _decomposed_model in compressed_decomposed_models:
+            _appearances = [_label for _label,_vals in compressed_model_reference.items()\
+                           if any([_val in _decomposed_model for _val in _vals])]
+            if verbose:
+                print("%s -> %s"%(str(_decomposed_model), ", ".join(sorted(_appearances))))
+            appearances.append(_appearances)
+
+        return mus_cd, appearances                
+    
+    def predict(self, X, show=False, show_kwargs={}):
+        """Predicts.
+        """
+        
+        isarray = isinstance(X,np.ndarray)
+        islist = isinstance(X,list) and all([isinstance(x,np.ndarray) for x in X])
+        if isarray:
+            p = np.array([self.fitted_kmeans[_k](X) for _k in sorted(self.fitted_kmeans)]).T
+            y = np.argmin(p,axis=1)
+        elif islist:
+            p = [np.array([self.fitted_kmeans[_k](x) for _k in sorted(self.fitted_kmeans)]).T for x in X]
+            y = [np.argmin(_p,axis=1) for _p in p]
+        else:
+            raise ValueError("X needs to be an array of a list of arrays!")
+        
+        if show:
+            self.show(X,y, **show_kwargs)
+            
+        return y
+    
+    def show(self, X, y, axes=[0,1], title=None, xlim=(0,1), ylim=(0,1),
+             xlabel=None, ylabel=None, labelfs=16, tickfs=14, legendfs=12,
+             titlefs=18, data_labels=None, cmap=plt.cm.jet, figsize=(10,5)):
+        """Plots."""
+        isarray = isinstance(X,np.ndarray)
+        islist = isinstance(X,list) and all([isinstance(x,np.ndarray) for x in X])
+        if islist:
+            _X = np.vstack(X)
+        else:
+            _X = np.copy(X)
+
+        uy = np.unique(y) if isarray else np.unique(np.hstack(y))
+        _y = np.copy(y) if isarray else np.hstack(y)
+        
+        norm = mpl.colors.Normalize(vmin=uy.min(), vmax=uy.max())
+
+        fig = plt.figure(figsize=figsize)
+        ax = fig.add_subplot(121) if islist else fig.add_subplot(111)
+        ax.set_aspect("equal")
+        hs = [None for _uy in uy]
+        for i,_uy in enumerate(uy):
+            idx = np.where(_y==_uy)[0]
+            ax.scatter(_X[idx,axes[0]], _X[idx,axes[1]], label="class %i"%_uy, 
+                       alpha=.5, color=cmap(norm(_uy*np.ones(len(idx)))))
+            ax.scatter(self.centroids_[i][:,axes[0]], self.centroids_[i][:,axes[1]],
+                       marker="+", edgecolor="r", color=cmap(norm(_uy*np.ones(len(self.centroids_[i])))),
+                       )
+        if xlabel is None:
+            ax.set_xlabel("Feature {}".format(axes[0]), fontsize=labelfs)
+        else:
+            ax.set_xlabel(xlabel, fontsize=labelfs)
+        if ylabel is None:
+            ax.set_ylabel("Feature {}".format(axes[1]), fontsize=labelfs)
+        else:
+            ax.set_ylabel(ylabel, fontsize=labelfs)
+        ax.set_xlim(xlim)
+        ax.set_ylim(ylim)
+        ax.set_title("Inferred classes",fontsize=labelfs)
+        ax.tick_params(labelsize=tickfs)
+        ax.legend(loc=0, fontsize=legendfs)
+
+        if islist:
+            ax2 = fig.add_subplot(122)
+            ax2.set_aspect("equal")
+            norm = mpl.colors.Normalize(vmin=0, vmax=len(X))
+            hs = [None for _X in X]
+            for i,_X in enumerate(X):
+                if data_labels is None:
+                    label = "trajectory #%i"%i
+                else:
+                    label = data_labels[i]
+                ax2.scatter(_X[:,axes[0]], _X[:,axes[1]], label=label, c=cmap(norm(np.ones(_X.shape[0])*i)),
+                            alpha=.5)
+            if xlabel is None:
+                ax2.set_xlabel("Feature {}".format(axes[0]), fontsize=labelfs)
+            else:
+                ax2.set_xlabel(xlabel, fontsize=labelfs)
+            if ylabel is None:
+                ax2.set_ylabel("Feature {}".format(axes[1]), fontsize=labelfs)
+            else:
+                ax2.set_ylabel(ylabel, fontsize=labelfs)
+            ax2.tick_params(labelsize=tickfs)
+            ax2.set_xlim(xlim)
+            ax2.set_ylim(ylim)
+            ax2.set_title("Trajectories", fontsize=labelfs)
+            ax2.legend(loc=0, fontsize=legendfs)
+        if not title is None:
+            plt.suptitle(title, fontsize=titlefs)
+        plt.tight_layout()
+        plt.show()
+        
+    def explain_inference(self, abbreviate=True):
+        assert not any([self.appearances is None, len(self.centroids_)==0]), "Class instance does not appear to have self.appearances and or self.centroids_ set."
+        
+        print("\nMaximally decomposed models:")
+        print("Components -> component appearances") 
+        for i, _appearances in enumerate(self.appearances):
+            _decomposed_model = self.centroids_[i].shape if abbreviate else self.centroids_[i]
+            print("%s -> %s"%(", ".join(sorted(_appearances)),_decomposed_model))
+            
+    def set_labels(self,labels):
+        """Sets labels for the label_map.
+        
+        Associates model identifier (integer value of self.centroids_)
+        with a string, e.g. name for a type of crystal.
+        
+        Parameters
+        ----------
+        labels : dict
+            Example: {"fcc":0, "fccVac":[1,2]}
+            
+        Note: 'labels' can also just set strings for a subset of model identifiers
+        since not always all names which should be assigned are immediately obvious.
+        The remaining labels are set to string versions of integer values.
+        """
+        assert isinstance(labels,dict)
+        assert all([isinstance(_k,str) for _k in labels.keys()])
+        assert all([isinstance(_v,(int,list,tuple)) for _v in labels.values()])
+        
+        if self.label_map is None:
+            self.label_map = dict()
+        
+        values = set()    
+        for _k, _v in labels.items():
+            self.label_map[_k] = _v
+            if isinstance(_v,int):
+                values.add(_v)
+            else:
+                for _v2 in _v:
+                    values.add(_v2)
+            
+        for _k in set(self.centroids_.keys()).difference(values):
+            self.label_map[str(_k)] = _k
 
 def assign_chemical_disorder_labels(atoms_dict, t_l_flat, Phi, mapper, species_flat, mapper_key=3,
                                     count_params={"elements":["Al","Ni"]}, 
